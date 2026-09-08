@@ -1,0 +1,105 @@
+/* Recall — 共通スタイル */
+:root {
+  --bg: #f7f7fb;
+  --surface: #ffffff;
+  --surface-2: #f2f2f7;
+  --border: #e3e3ee;
+  --border-strong: #cfcfe0;
+  --text: #16161d;
+  --text-dim: #6b6b80;
+  --text-faint: #9a9aae;
+  --accent: #6d5aff;
+  --accent-soft: #efecff;
+  --accent-text: #5a45f0;
+  --danger: #e0455c;
+  --ok: #0f9d6a;
+  --warn: #d9820b;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow: 0 1px 2px rgba(16,16,40,.06), 0 8px 24px rgba(16,16,40,.06);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", Meiryo, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131318;
+    --surface: #1b1b22;
+    --surface-2: #23232c;
+    --border: #2e2e39;
+    --border-strong: #3d3d4b;
+    --text: #ececf2;
+    --text-dim: #a2a2b4;
+    --text-faint: #75758a;
+    --accent: #8b7bff;
+    --accent-soft: #292244;
+    --accent-text: #b3a6ff;
+    --danger: #ff7086;
+    --ok: #3fd39a;
+    --warn: #f0a83a;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent-text); text-decoration: none; }
+a:hover { text-decoration: underline; }
+button, input, select, textarea { font: inherit; color: inherit; }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 7px 13px; border-radius: var(--radius); border: 1px solid var(--border-strong);
+  background: var(--surface); cursor: pointer; white-space: nowrap;
+  transition: background .12s, border-color .12s, transform .05s;
+}
+.btn:hover { background: var(--surface-2); }
+.btn:active { transform: translateY(1px); }
+.btn[disabled] { opacity: .45; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.07); background: var(--accent); }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--text-dim); }
+.btn.ghost:hover { background: var(--surface-2); color: var(--text); }
+.btn.danger { color: var(--danger); border-color: transparent; background: transparent; }
+.btn.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.btn.sm { padding: 4px 9px; font-size: 12px; border-radius: 8px; }
+
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field > label { font-size: 11.5px; font-weight: 600; color: var(--text-dim); letter-spacing: .02em; }
+input[type=text], input[type=search], input[type=number], select, textarea {
+  width: 100%; padding: 8px 10px; border-radius: var(--radius);
+  border: 1px solid var(--border-strong); background: var(--surface); outline: none;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+textarea { resize: vertical; min-height: 58px; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 8px; border-radius: 999px; font-size: 11.5px;
+  background: var(--surface-2); color: var(--text-dim); border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.chip .x { cursor: pointer; opacity: .6; font-size: 13px; line-height: 1; }
+.chip .x:hover { opacity: 1; color: var(--danger); }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+.muted { color: var(--text-dim); }
+.faint { color: var(--text-faint); }
+.row { display: flex; align-items: center; gap: 8px; }
+.grow { flex: 1; min-width: 0; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hidden { display: none !important; }
+
+.bar { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); border-radius: 999px; transition: width .3s; }
+.bar.warn > i { background: var(--warn); }
+.bar.danger > i { background: var(--danger); }
+
+.favicon { width: 16px; height: 16px; border-radius: 4px; flex: none; object-fit: contain; background: var(--surface-2); }
