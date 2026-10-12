@@ -121,8 +121,11 @@ async function sendToKininari(itemId, sendResponse) {
   if (!clipEnabled(meta)) { sendResponse({ ok: false, status: 'off', message: CLIP_MESSAGE.off }); return; }
 
   // まず待ち行列に載せる。ここで失敗しても項目は消えないし、あとから必ず送り直せる。
+  // 「送信済み（未確認）」を送り直すときは前と同じ番号で送る。前の分が届いていれば、
+  // 気になり帳は二重に登録せず「もう入っている」と返す（確認できたことになる）
   const before = item.kn || 0;
-  const added = await enqueueClip(itemId);
+  const reuse = item.kn && !item.knc && item.knk ? item.knk : '';
+  const added = await enqueueClip(itemId, { nonce: reuse });
   if (added && added.refused) {
     sendResponse({ ok: false, status: 'full', message: '未送信が多すぎます。先に「今すぐ送る」で片付けてください。' });
     return;
@@ -134,18 +137,18 @@ async function sendToKininari(itemId, sendResponse) {
   // 「待ち行列に無い＝送れた」ではなく、項目に印が付いたかどうかで判断する
   const after = (await getAll()).items.find(i => i.id === itemId);
   if (after && (after.kn || 0) > before) {
-    sendResponse({
-      ok: true,
-      status: after.knc ? 'saved' : 'blind',
-      message: after.knc ? CLIP_MESSAGE.saved : CLIP_MESSAGE.blind
-    });
+    const st = (res.results && res.results[itemId]) || (after.knc ? 'saved' : 'blind');
+    sendResponse({ ok: true, status: st, message: CLIP_MESSAGE[st] || (after.knc ? CLIP_MESSAGE.saved : CLIP_MESSAGE.blind) });
     return;
   }
   const stillQueued = (await queueSummary()).entries.find(e => e.id === itemId);
+  const why = stillQueued && stillQueued.status;
   sendResponse({
     ok: false,
-    status: (stillQueued && stillQueued.status) || 'failed',
-    message: '送れませんでした。あとで自動で送り直します（設定から今すぐ送ることもできます）',
+    status: why || 'failed',
+    // 容量不足・形式エラーは待っても直らないので、自動では送り直さない（理由をそのまま出す）
+    message: (why === 'quota' || why === 'parse') ? CLIP_MESSAGE[why]
+      : '送れませんでした。あとで自動で送り直します（設定から今すぐ送ることもできます）',
     err: (stillQueued && stillQueued.err) || '',
     left: res.left
   });
@@ -332,7 +335,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // 「元に戻す」で戻した項目を、気になり帳へ送る順番待ちに並べ直す。
     // 待ち行列の書き換えは Service Worker の中で順番に行う（画面から直接書くと取り合いになる）
     (async () => {
-      for (const id of (Array.isArray(msg.ids) ? msg.ids : [])) await enqueueClip(id);
+      // 消す前の番号のまま並べ直す（消す前の送信が届いていたら、気になり帳が二重にしない）
+      const nonces = (msg.nonces && typeof msg.nonces === 'object') ? msg.nonces : {};
+      for (const id of (Array.isArray(msg.ids) ? msg.ids : [])) await enqueueClip(id, { nonce: nonces[id] });
       flushClips();
     })().then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
     return true;

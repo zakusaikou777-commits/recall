@@ -437,6 +437,10 @@ const openedTabs = [];
 const onPage = (pg) => { openedTabs.push(pg); };   // 通知時点では about:blank なので後で URL を見る
 ctx.on('page', onPage);
 const clipTabsNow = () => openedTabs.filter(pg => pg.url().includes('#knadd='));
+const waitUntilTabs = async (n, ms = 15000) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end && clipTabsNow().length < n) await lib.waitForTimeout(250);
+};
 
 // 前のセクションで保存済みの動画と重ならないよう、新しい動画IDを使う
 const knPop = await openPopup('https://www.youtube.com/watch?v=knTestVid01', '送信テストの動画', 'kn-popup');
@@ -465,6 +469,7 @@ ok('YouTube のサムネイルURLが付く', sent && /i\.ytimg\.com\/vi\/knTestV
 ok('タグを項目として送る', sent && Array.isArray(sent.tags) && sent.tags.includes('テストタグ'));
 ok('復習の進み具合を送る', sent && sent.srs && typeof sent.srs.d === 'number' && sent.srs.d > 0);
 eq2('新しい項目は未読で送る', sent && sent.srs && sent.srs.st, 0);
+ok('クリップの番号を付けて送る（気になり帳が二重登録を防ぐ）', sent && /^[0-9a-f]{32}$/.test(sent.k || ''));
 
 // 送った印が付き、裏タブは自動で閉じられる
 const clipped = (await readItems()).find(i => i.u.includes('knTestVid01'));
@@ -480,6 +485,17 @@ await knPop2.fill('#note', 'あとから直したメモ');
 await knPop2.click('#save');
 await lib.waitForTimeout(3500);
 ok('更新では送らない', clipTabsNow().length === clipsBefore);
+ok('送った番号を項目に残す', (await readItems()).find(i => i.u.includes('knTestVid01')).knk === sent.k);
+
+// 「送信済み（未確認）」を送り直すときは同じ番号で（届いていれば気になり帳が「もう入っている」と返す）
+const knPop3 = await openPopup('https://www.youtube.com/watch?v=knTestVid01', '送信テストの動画', 'kn-popup3');
+ok('未確認の項目には送り直しのボタンが出る', await knPop3.locator('#knSend').isVisible());
+await knPop3.click('#knSend');
+await waitUntilTabs(clipsBefore + 1);
+const resent = clipTabsNow().slice(clipsBefore).map(pg => { try { return JSON.parse(decodeURIComponent(pg.url().split('#knadd=')[1])); } catch { return null; } })[0];
+eq2('回帰: 未確認の送り直しは同じ番号を使う', resent && resent.k, sent && sent.k);
+await lib.waitForTimeout(12000);
+await knPop3.close().catch(() => {});
 
 section('回帰: 裏タブは一度に1つ');
 // 権限を許可していない状態で複数件を送っても、裏タブが一斉に開かないこと
@@ -1288,7 +1304,7 @@ await lib.evaluate(() => { window.confirm = () => true; });
 await lib.click('#gdDisconnect');
 await waitUntil(async () => (await lib.locator('#gdMsg').innerText()).includes('やめました'), 8000);
 ok('同期をやめられる', (await lib.evaluate(async () => (await chrome.storage.sync.get('meta')).meta.s.driveOn)) === false);
-ok('やめたら「つなぐ」に戻る', await lib.locator('#gdConnect').isVisible());
+ok('やめたら「つなぐ」に戻る', await waitUntil(async () => lib.locator('#gdConnect').isVisible(), 5000));
 await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
 
 section('後片付け');

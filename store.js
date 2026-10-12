@@ -257,7 +257,9 @@ export function makeItem(raw, meta) {
     rv: Math.max(0, Number(partial.rv) || 0),
     iv,
     kn: Math.max(0, Number(partial.kn) || 0),  // 気になり帳へ送った時刻（0 = 未送信）
-    knc: partial.knc ? 1 : 0                   // 1 = 保存されたことを確認できた / 0 = 未確認
+    knc: partial.knc ? 1 : 0,                  // 1 = 保存されたことを確認できた / 0 = 未確認
+    // 気になり帳へ送ったときの番号（送り直すときに使い回し、気になり帳に二重登録させない）。無ければ持たない
+    ...(/^[0-9a-f]{8,64}$/.test(String(partial.knk || '')) ? { knk: partial.knk } : {})
   };
 }
 

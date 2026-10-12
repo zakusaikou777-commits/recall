@@ -66,7 +66,8 @@ const fakeBrowser = {
   attempts: 0,               // タブを開こうとした回数（失敗も数える）
   onCreate: null,            // タブを開いた瞬間に割り込む処理（送信中の削除など）
   alarms: new Map(),
-  reset() { this.createFails = false; this.hasPermission = true; this.savedFlag = true; this.tabs.clear(); this.created = []; this.attempts = 0; this.onCreate = null; }
+  reply: undefined,          // 気になり帳の返事（{saved, status}）。未設定なら savedFlag（古い版の気になり帳）
+  reset() { this.createFails = false; this.hasPermission = true; this.savedFlag = true; this.reply = undefined; this.tabs.clear(); this.created = []; this.attempts = 0; this.onCreate = null; }
 };
 const sessionMem = {};
 globalThis.chrome = {
@@ -85,7 +86,7 @@ globalThis.chrome = {
   },
   scripting: {
     executeScript: async (opts) => {
-      if (opts && opts.world === 'MAIN') return [{ result: fakeBrowser.savedFlag }];
+      if (opts && opts.world === 'MAIN') return [{ result: fakeBrowser.reply !== undefined ? fakeBrowser.reply : fakeBrowser.savedFlag }];
       if (scriptingResult instanceof Error) throw scriptingResult;
       return [{ result: scriptingResult }];
     }
@@ -1339,6 +1340,83 @@ ok('オフになる', (await S.getMeta()).s.driveOn === false);
 ok('許可（トークン）を手放す', fakeDrive.removedTokens.length >= 2);
 eq('控えも消す', await DR.getDriveState(), {});
 await S.removeItems([]);
+await resetAll();
+
+/* ---------- 1.9.0: 気になり帳との連携のすき間 ---------- */
+console.log('\n--- 気になり帳へ送る: 段位を気になり帳の間隔にそろえる ---');
+eq('既定の間隔ならそのまま', [0, 1, 2, 3, 4, 5, 6].map(b => KN.knBox(b, S.DEFAULT_STEPS)), [0, 1, 2, 3, 4, 5, 6]);
+eq('間隔を変えていたら、いちばん近い日数の段にする', [0, 1, 2, 3].map(b => KN.knBox(b, [2, 5, 14, 45])), [0, 1, 3, 4]);
+eq('長い間隔は最後の段まで', KN.knBox(0, [400]), 6);
+const knItem2 = S.makeItem({ u: 'https://kn.example/steps', t: '段位', s: 1, b: 2 }, meta);
+eq('送る復習の段位は気になり帳の段', KN.srsFor(knItem2, [2, 5, 14, 45]).b, 3);
+eq('次回の予定はそのまま', KN.srsFor(knItem2, [2, 5, 14, 45]).d, knItem2.d);
+
+console.log('\n--- 気になり帳へ送る: クリップの番号 ---');
+const nonce1 = KN.newClipNonce();
+ok('番号は16進32桁', /^[0-9a-f]{32}$/.test(nonce1) && nonce1 !== KN.newClipNonce());
+const withK = KN.buildClipUrl('https://k.example/kininari.html', { title: 't', url: 'https://a.example/', note: '', nonce: nonce1 });
+eq('番号を k で送る（気になり帳が二重登録を防ぐ）', JSON.parse(decodeURIComponent(withK.url.split('#knadd=')[1])).k, nonce1);
+const badK = KN.buildClipUrl('https://k.example/kininari.html', { title: 't', url: 'https://a.example/', note: '', nonce: 'xyz<>' });
+ok('形の違う番号は送らない', !('k' in JSON.parse(decodeURIComponent(badK.url.split('#knadd=')[1]))));
+ok('送った番号は項目に残る（保存し直しても消えない）', S.makeItem(KN.markClipped(knItem2, false, nonce1), meta).knk === nonce1);
+ok('番号の無い項目には付けない', !('knk' in S.makeItem(knItem2, meta)));
+
+console.log('\n--- 気になり帳の返事を読む ---');
+eq('古い版（保存の印だけ）', KN.readClipReply([true]), { done: true, status: 'saved' });
+eq('保存した', KN.readClipReply([{ saved: true, status: 'saved' }]), { done: true, status: 'saved' });
+eq('もう入っていた', KN.readClipReply([{ saved: true, status: 'dup' }]), { done: true, status: 'dup' });
+eq('容量不足', KN.readClipReply([{ saved: false, status: 'quota' }]), { done: true, status: 'quota' });
+eq('形式エラー', KN.readClipReply([{ saved: false, status: 'parse' }]), { done: true, status: 'parse' });
+eq('まだ返事が無い', KN.readClipReply([{ saved: false, status: '' }, null]), { done: false });
+eq('結合アプリ（iframe の中の気になり帳）', KN.readClipReply([{ saved: false, status: '' }, { saved: true, status: 'saved' }]), { done: true, status: 'saved' });
+
+console.log('\n--- 気になり帳へ送る: 送り直しと返事 ---');
+await resetAll({ ...structuredClone(knMeta), s: { ...knMeta.s, knOn: true, knUrl: 'https://example.com/kininari.html' } });
+fakeBrowser.reset();
+const sentKs = [];
+fakeBrowser.onCreate = (url) => { try { sentKs.push(JSON.parse(decodeURIComponent(url.split('#knadd=')[1])).k); } catch { sentKs.push(null); } };
+const rItem = S.makeItem({ u: 'https://retry.example/a', t: '送り直し' }, knMeta);
+await S.putItems([rItem]);
+await KN.enqueueClip(rItem.id);
+fakeBrowser.reply = { saved: false, status: '' };     // 返事が来ない（保存できたか分からない）
+fakeBrowser.hasPermission = true;
+let flushR = await KN.flushClips({ force: true });
+eq('返事が来なければ未送信のまま', flushR.left, 1);
+fakeBrowser.reply = { saved: true, status: 'dup' };   // 実は1回目が届いていた
+flushR = await KN.flushClips({ force: true });
+eq('送り直しても番号は同じ', [sentKs.length, new Set(sentKs).size, /^[0-9a-f]{32}$/.test(sentKs[0])], [2, 1, true]);
+const rAfter = (await S.getAll()).items.find(i => i.id === rItem.id);
+ok('「もう入っていた」なら送信済み（確認済み）にする', rAfter.kn > 0 && rAfter.knc === 1);
+eq('送った番号を項目に残す', rAfter.knk, sentKs[0]);
+eq('結果に返事の種類が入る', flushR.results[rItem.id], 'dup');
+
+const quotaItem = S.makeItem({ u: 'https://retry.example/quota', t: '容量不足' }, knMeta);
+await S.putItems([quotaItem]);
+await KN.enqueueClip(quotaItem.id);
+fakeBrowser.reply = { saved: false, status: 'quota' };
+await KN.flushClips({ force: true });
+let qe = (await KN.queueSummary()).entries.find(e => e.id === quotaItem.id);
+ok('容量不足は理由を残し、自動では送り直さない', qe && qe.status === 'quota' && qe.tries >= KN.MAX_TRIES && /容量/.test(qe.err));
+eq('画面には理由を出す', KN.clipStateOf(quotaItem, qe).text, '送れていません（気になり帳の保存容量がいっぱい）');
+const attemptsQ = fakeBrowser.attempts;
+await KN.flushClips({ retry: true });
+eq('5分ごとの再送でも開かない', fakeBrowser.attempts, attemptsQ);
+await KN.resetQueueTries();
+fakeBrowser.reply = { saved: true, status: 'saved' };
+await KN.flushClips({ force: true });
+ok('「今すぐ送る」なら送り直せる', (await S.getAll()).items.find(i => i.id === quotaItem.id).kn > 0);
+fakeBrowser.reply = { saved: false, status: 'parse' };
+const pItem = S.makeItem({ u: 'https://retry.example/parse', t: '形式' }, knMeta);
+await S.putItems([pItem]);
+await KN.enqueueClip(pItem.id);
+await KN.flushClips({ force: true });
+eq('形式エラーも理由を出す', KN.clipStateOf(pItem, (await KN.queueSummary()).entries.find(e => e.id === pItem.id)).text, '送れていません（気になり帳が受け取れない形式）');
+const reuseK = KN.newClipNonce();
+await KN.removeFromQueue(pItem.id);
+await KN.enqueueClip(pItem.id, { nonce: reuseK });
+eq('前の番号を使って並べ直せる（未確認の送り直し・元に戻す）', (await KN.queueSummary()).entries.find(e => e.id === pItem.id).k, reuseK);
+await KN.removeFromQueue(pItem.id);
+fakeBrowser.reset();
 await resetAll();
 
 console.log(`\n${pass} 件成功 / ${fail} 件失敗`);

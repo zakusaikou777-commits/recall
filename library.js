@@ -451,8 +451,10 @@ async function deleteItems(list) {
     // 気になり帳へ送る順番待ちだったものは、戻したときに並び直す
     //（消している間に待ち行列から外されると、戻しても二度と送られない）
     let queued = [];
-    try { const q = await getQueue(); queued = snap.filter(i => q.some(e => e.id === i.id)).map(i => i.id); }
-    catch { queued = []; }
+    try {
+      const q = await getQueue();
+      queued = snap.map(i => q.find(e => e.id === i.id)).filter(Boolean).map(e => ({ id: e.id, k: e.k || '' }));
+    } catch { queued = []; }
     if (!(await removeMany(snap.map(i => i.id)))) return false;
     const g = (undoFn && undoGroup) ? undoGroup : { items: [], rich: {}, queued: [] };
     for (const s of snap) if (!g.items.some(x => x.id === s.id)) g.items.push(s);
@@ -479,8 +481,10 @@ async function restoreGroup(g) {
   try { muteReload = true; res = await restoreItems(list, Object.keys(g.rich).length ? g.rich : undefined); }
   finally { muteReload = false; }
   if (!res || !res.ok) { alert((res && res.error) || '元に戻せませんでした'); return; }
-  const requeue = [...new Set(g.queued)].filter(id => !sent[id]);
-  if (requeue.length) chrome.runtime.sendMessage({ type: 'clipRequeue', ids: requeue });
+  const nonces = {};
+  for (const q of g.queued) if (q && q.id && q.k) nonces[q.id] = q.k;
+  const requeue = [...new Set(g.queued.map(q => q.id))].filter(id => !sent[id]);
+  if (requeue.length) chrome.runtime.sendMessage({ type: 'clipRequeue', ids: requeue, nonces });
   ({ items, meta, rich } = await getAll());
   chrome.runtime.sendMessage({ type: 'refresh' });
   render();
