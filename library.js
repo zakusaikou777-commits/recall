@@ -2,9 +2,10 @@
    Recall — ライブラリ画面
    ============================================================ */
 import {
-  getAll, putItems, removeItems, restoreItems, replaceMeta, makeItem, review, resume, isDue, usage,
+  getAll, putItems, removeItems, restoreItems, replaceMeta, review, resume, isDue, usage,
   domainOf, faviconUrl, fmtDate, tagCounts, matches, normalizeTags, clip, wipeAll,
-  thumbOf, youtubeId, fmtDuration, syncPush, isSavableUrl, csvCell, startOfToday,
+  thumbOf, youtubeId, fmtDuration, syncPush, isSavableUrl, csvCell, startOfToday, normalizeUrl,
+  planImport, sanitizeSettings, syncMaxOf,
   STATUS, STATUS_LABEL, PRESET_INTERVALS, CAT_COLORS, DEFAULT_STEPS, DEFAULT_META,
   newId, LIMITS
 } from './store.js';
@@ -280,7 +281,8 @@ function card(it) {
   const star = document.createElement('button');
   star.className = 'star' + (it.f ? ' on' : ''); star.textContent = it.f ? '★' : '☆';
   star.title = 'お気に入り';
-  star.onclick = async () => { await save([{ ...it, f: it.f ? 0 : 1 }]); };
+  // ダブルクリックで2回切り替わって元に戻らないよう、ほかのボタンと同じく連打を受け付けない
+  star.onclick = cardAction(() => save([{ ...it, f: it.f ? 0 : 1 }]));
   acts.appendChild(star);
 
   if (it.s === STATUS.NEW || it.s === STATUS.LEARNING) {
@@ -536,7 +538,29 @@ function openEdit(it) {
   fillIvSelect($('eIv'), it.iv || 0);
   $('eStatus').value = String(it.s);
   $('eDue').value = it.d ? toDateInput(it.d) : '';
+  checkEditUrl();
   $('editDlg').showModal();
+}
+
+/**
+ * 編集した URL を確かめる。http/https 以外（javascript: など）と、ほかの項目と同じページは保存させない
+ * （読み込みやポップアップでは弾いているのに、編集だけ素通りしていた）。
+ * 入力欄に理由を付けておくと、保存ボタンを押したときにブラウザが止めて知らせてくれる。
+ */
+function checkEditUrl() {
+  const box = $('eUrl');
+  const v = box.value.trim();
+  let msg = '';
+  if (editing && v && v !== editing.u) {
+    if (!isSavableUrl(v)) msg = 'http:// または https:// で始まる URL を入れてください。';
+    else {
+      const key = normalizeUrl(v);
+      const other = items.find(i => i.id !== editing.id && normalizeUrl(i.u) === key);
+      if (other) msg = `同じページがすでに保存されています（「${clip(other.t, 30)}」）。`;
+    }
+  }
+  box.setCustomValidity(msg);
+  return !msg;
 }
 
 function fillCatSelect(sel, value) {
@@ -609,6 +633,9 @@ function showFocus() {
   const ok = review(it, 'ok', meta), again = review(it, 'again', meta);
   $('fOkSub').textContent = ok.s === STATUS.DONE ? '完了にする' : `次は${daysFromToday(ok.d)}日後`;
   $('fAgainSub').textContent = `${daysFromToday(again.d)}日後`;
+  // 前のカードで押したボタンにフォーカスが残っていると、Space / Enter で次のカードにも同じ操作がかかる
+  const active = document.activeElement;
+  if (active && active !== document.body && $('focus').contains(active)) active.blur();
   focusShownAt = Date.now();
 }
 
@@ -829,6 +856,8 @@ function renderCatEditor() {
       const moved = items.filter(i => i.c === cid).map(i => ({ ...i, c: meta.cats[0].id }));
       meta.cats = meta.cats.filter(y => y.id !== cid);
       if (meta.s.defaultCat === cid) meta.s.defaultCat = meta.cats[0].id;
+      // このカテゴリを覚えているサイトも忘れる（残すと即保存が消えたカテゴリに入れてしまう）
+      for (const [d, c] of Object.entries(meta.dom || {})) if (c === cid) delete meta.dom[d];
       await saveMeta();
       if (moved.length) await save(moved);
       renderCatEditor(); fillCatSelect($('sCat'), meta.s.defaultCat); render();
@@ -886,10 +915,10 @@ async function importJson(file) {
   try {
     const data = JSON.parse(await file.text());
     const incoming = Array.isArray(data.items) ? data.items : [];
-    let importNote = '';
+    let importNote = '', settingsNote = '';
     if (!incoming.length) { $('setMsg').textContent = '読み込める項目がありませんでした。'; return; }
+    let metaChanged = false, settingsTaken = false;
     if (data.meta && Array.isArray(data.meta.cats)) {
-      const known = new Set(meta.cats.map(c => c.id));
       // まだ何も保存していない（＝既定のカテゴリのまま）なら、書き出し元の名前と色をそのまま使う
       const untouched = items.length === 0 &&
         JSON.stringify(meta.cats) === JSON.stringify(DEFAULT_META.cats);
@@ -906,34 +935,37 @@ async function importJson(file) {
         } else {
           meta.cats.push({ id, name, color });
         }
-        known.add(id);
       }
       importNote = skipped ? `（カテゴリ ${skipped} 件は既存と重なったため取り込みませんでした）` : '';
-      await saveMeta();
+      metaChanged = true;
     }
-    const have = new Set(items.map(i => i.id));
-    const add = [];
-    const addRich = {};
+    // 設定（復習の間隔・通知・気になり帳の送り先など）。いまの設定と違うときだけ、置き換えてよいか尋ねる
+    if (data.meta && data.meta.s && typeof data.meta.s === 'object') {
+      const { s, changed } = sanitizeSettings(data.meta.s, meta.s, { cats: meta.cats, knCats: KN_CATEGORIES });
+      if (changed.length && confirm('バックアップの設定（復習の間隔・通知・同期・気になり帳の送り先など）で、いまの設定を置き換えますか？\n\n［キャンセル］を押すと、項目とカテゴリだけを読み込みます。')) {
+        meta.s = s;
+        metaChanged = settingsTaken = true;
+        settingsNote = '（設定も読み込みました）';
+      }
+    }
+    if (metaChanged) await saveMeta();
+
+    // 同じ ID・同じページがすでにあるものは読み込まない。同期で届いた分がある PC に
+    // バックアップを読み込むと、そのぶんがそっくり二重になってしまうため
+    const existing = (await getAll()).items;
+    const { add, dup, invalid } = planImport(existing, incoming, meta);
     const incomingRich = (data.rich && typeof data.rich === 'object') ? data.rich : {};
-    let invalid = 0;
-    for (const raw of incoming) {
-      // http/https で始まらないもの（URL が無い・javascript: など）は読み込まない。
-      // URL が無いと一覧に出ないのに件数にだけ数えられ、消すこともできなくなる
-      if (!raw || typeof raw !== 'object') { invalid++; continue; }
-      const oldId = raw.id;
-      const it = makeItem(raw, meta);
-      if (!isSavableUrl(it.u)) { invalid++; continue; }
-      while (have.has(it.id)) it.id = newId();   // 取り込み中に採番した ID も衝突判定に含める
-      have.add(it.id);
-      add.push(it);
+    const addRich = {};
+    for (const { item, oldId } of add) {
       const r = incomingRich[oldId];             // ID が変わってもサムネイル情報を引き継ぐ
-      if (r && typeof r === 'object') addRich[it.id] = r;
+      if (r && typeof r === 'object') addRich[item.id] = r;
     }
+    const list = add.map(a => a.item);
     let done = 0, failure = '';
     try {
       muteReload = true;
-      for (let i = 0; i < add.length; i += 20) {   // 書き込み回数制限に配慮して小分けにする
-        const chunk = add.slice(i, i + 20);
+      for (let i = 0; i < list.length; i += 20) {   // 書き込み回数制限に配慮して小分けにする
+        const chunk = list.slice(i, i + 20);
         const chunkRich = {};
         for (const it of chunk) if (addRich[it.id]) chunkRich[it.id] = addRich[it.id];
         const res = await putItems(chunk, chunkRich);
@@ -941,12 +973,19 @@ async function importJson(file) {
         done += chunk.length;
       }
     } finally { muteReload = false; }
+    if (settingsTaken) await syncPush();         // 同期の設定が変わっていれば載せ直す
     ({ items, meta, rich } = await getAll());
     render();
+    // 開いている設定ダイアログの欄を読み込んだ内容に合わせる（閉じたときに古い値で書き戻さないように）
+    if (settingsTaken) openSettingsForm();
+    else if (metaChanged) { renderCatEditor(); fillCatSelect($('sCat'), $('sCat').value); }
+    if (settingsTaken) chrome.runtime.sendMessage({ type: 'refresh' });
     const skipNote = invalid ? `（URL が http:// / https:// でない ${invalid} 件は読み込みませんでした）` : '';
+    const dupNote = dup ? `（すでに保存してある ${dup} 件は読み込みませんでした）` : '';
     $('setMsg').textContent = (failure
       ? `${done} 件まで読み込んだところで中断しました: ${failure}`
-      : (done ? `${done} 件を読み込みました。` : '読み込める項目がありませんでした。')) + skipNote + importNote;
+      : (done ? `${done} 件を読み込みました。` : (dup ? '新しく読み込む項目はありませんでした。' : '読み込める項目がありませんでした。')))
+      + dupNote + skipNote + importNote + settingsNote;
   } catch (e) {
     $('setMsg').textContent = '読み込みに失敗しました: ' + e.message;
   }
@@ -1006,6 +1045,7 @@ function bind() {
   };
 
   // 編集ダイアログ
+  $('eUrl').addEventListener('input', checkEditUrl);
   $('editDlg').addEventListener('close', async () => {
     if ($('editDlg').returnValue !== 'save' || !editing) { editing = null; return; }
     const base = editing;                            // 開いたときの内容
@@ -1021,6 +1061,7 @@ function bind() {
       s: Number($('eStatus').value)
     };
     const was = { t: base.t, u: base.u, n: base.n || '', c: base.c, g: base.g || [], iv: base.iv || 0, s: base.s };
+    if (form.u !== was.u && !isSavableUrl(form.u)) form.u = was.u;   // 念のため（入力欄の確認をすり抜けても保存しない）
     const due = $('eDue').value;
     const dueTouched = due !== (base.d ? toDateInput(base.d) : '');
     const wasFocus = !$('focus').classList.contains('hidden');
@@ -1081,7 +1122,7 @@ function bind() {
     meta.s.thumbs = $('sThumbs').checked;
     meta.s.embed = $('sEmbed').checked;
     meta.s.sync = $('sSync').checked;
-    meta.s.syncMax = Math.min(500, Math.max(0, Number($('sSyncMax').value) || 300));
+    meta.s.syncMax = Math.min(500, syncMaxOf({ s: { syncMax: $('sSyncMax').value } }));   // 0 も有効な値
     meta.s.hour = Number($('sHour').value);
     const cat = $('sCat').value;
     meta.s.defaultCat = meta.cats.some(c => c.id === cat) ? cat : meta.cats[0].id;
@@ -1133,7 +1174,11 @@ function bind() {
   $('impBtn').onclick = () => $('impFile').click();
   $('impFile').addEventListener('change', e => { if (e.target.files[0]) importJson(e.target.files[0]); e.target.value = ''; });
   $('wipe').onclick = async () => {
-    if (!confirm('保存したページと設定をすべて削除します。元に戻せません。よろしいですか？')) return;
+    // 同期オンなら、ほかの PC からも消える。同期オフならこの端末の項目だけ（wipeAll と同じ分け方）
+    const first = meta.s.sync !== false
+      ? '保存したページと設定をすべて削除します。\n同期している ほかの PC からも消えます。元に戻せません。よろしいですか？'
+      : 'この端末に保存したページをすべて削除します（同期はオフなので、ほかの PC の項目と設定はそのまま残ります）。元に戻せません。よろしいですか？';
+    if (!confirm(first)) return;
     if (!confirm('本当に削除しますか？ 先に「JSONで書き出し」をおすすめします。')) return;
     try { muteReload = true; await wipeAll(); }
     finally { muteReload = false; }
@@ -1187,7 +1232,9 @@ function bind() {
       if (e.key === 'Escape') return endFocus();
       if (e.key === '1') return focusAnswer('again');
       if (e.key === '2') return focusAnswer('later');
-      if (e.key === '3' || e.key === 'Enter') { e.preventDefault(); return focusAnswer('ok'); }
+      // Space も「覚えた」。既定の動作（フォーカスのあるボタンを押す）は止める。
+      // 止めないと、直前にマウスで押した「削除」などが次のカードにもかかる
+      if (e.key === '3' || e.key === 'Enter' || e.key === ' ') { e.preventDefault(); return focusAnswer('ok'); }
       if (e.key === 'o') return $('fOpen').click();
       return;
     }

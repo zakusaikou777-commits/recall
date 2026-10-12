@@ -941,5 +941,147 @@ ok('同期容量の文言', S.describeQuotaError(new Error('QUOTA_BYTES quota ex
 ok('件数超過の文言', S.describeQuotaError(new Error('MAX_ITEMS quota exceeded')).includes('件'));
 ok('端末容量の文言', S.describeLocalError(new Error('QUOTA_BYTES quota exceeded')).includes('端末'));
 
+/* ---------- 1.8.2 の回帰テスト ---------- */
+console.log('\n--- 回帰: ドメインの記憶は「最近使った順」で刈り込む ---');
+await resetAll();
+await S.setMeta({ dom: { 'daily.example': 'c1' } });
+for (let i = 0; i < S.DOM_MAX - 1; i++) await S.setMeta({ dom: { ['site' + i + '.example']: 'c2' } });
+await S.setMeta({ dom: { 'daily.example': 'c1' } });          // いま使い直した
+let domKeys = Object.keys((await S.getMeta()).dom);
+eq('使い直したドメインは末尾（いちばん新しい）へ', domKeys[domKeys.length - 1], 'daily.example');
+await S.setMeta({ dom: { 'new.example': 'c3' } });
+domKeys = Object.keys((await S.getMeta()).dom);
+ok('新しいサイトを足しても、使い直したドメインは残る', domKeys.includes('daily.example'));
+ok('いちばん古いものから落ちる', !domKeys.includes('site0.example') && domKeys.length === S.DOM_MAX);
+eq('使い直すとカテゴリも新しい値になる', (await S.setMeta({ dom: { 'daily.example': 'c4' } })).meta.dom['daily.example'], 'c4');
+
+console.log('\n--- 回帰: 消したカテゴリは選ばない ---');
+const catMeta = { ...structuredClone(meta), cats: meta.cats.filter(c => c.id !== 'c3') };
+eq('覚えているカテゴリがあればそれ', S.pickCat(catMeta, 'c2', 'c1'), 'c2');
+eq('消えていれば次の候補（既定のカテゴリ）', S.pickCat(catMeta, 'c3', 'c1'), 'c1');
+eq('どれも無ければ先頭のカテゴリ', S.pickCat(catMeta, 'c3', 'gone', undefined), 'c0');
+eq('meta が壊れていても既定のカテゴリ', S.pickCat(null, 'x'), S.DEFAULT_META.cats[0].id);
+
+console.log('\n--- 回帰: 同期する件数の上限を 0 にできる ---');
+eq('0 は 0 のまま', S.syncMaxOf({ s: { syncMax: 0 } }), 0);
+eq('文字の "0" も 0', S.syncMaxOf({ s: { syncMax: '0' } }), 0);
+eq('空・不正な値は既定値', [S.syncMaxOf({ s: { syncMax: '' } }), S.syncMaxOf({ s: { syncMax: 'abc' } }), S.syncMaxOf({ s: {} })], [300, 300, 300]);
+await resetAll({ ...structuredClone(meta), s: { ...meta.s, syncMax: 0 } });
+await S.putItems([S.makeItem({ u: 'https://zero.example/1', t: '同期しない' }, meta)]);
+eq('上限 0 なら同期には載せない', Object.keys(syncArea._mem).filter(k => k.startsWith(S.ITEM_PREFIX)).length, 0);
+eq('端末内には保存される', (await S.getAll()).items.length, 1);
+
+console.log('\n--- 回帰: 読み込みで二重にしない ---');
+const have1 = S.makeItem({ u: 'https://have.example/a?utm_source=x', t: 'すでにある' }, meta);
+const have2 = S.makeItem({ u: 'https://have.example/b', t: 'すでにある2' }, meta);
+const plan = S.planImport([have1, have2], [
+  { ...have1, t: '同じ ID' },                                   // 同期で届いていた分（同じ ID）
+  { id: 'other-id', url: 'https://have.example/b#top', title: '同じページ' },   // ID は違うが同じページ
+  { url: 'https://new.example/1', title: '新しい' },
+  { url: 'https://new.example/1?utm_medium=y', title: 'ファイルの中で重複' },
+  { id: 'keep-id', u: 'https://new.example/2', t: 'ID を保つ' },
+  { url: 'javascript:alert(1)' }, null, 'x'
+], meta);
+eq('新しいものだけ読み込む', plan.add.map(a => a.item.t), ['新しい', 'ID を保つ']);
+eq('すでにある分の件数', plan.dup, 3);
+eq('読み込めない分の件数', plan.invalid, 3);
+eq('ID はそのまま使う（サムネイル情報を引き継げる）', plan.add[1].item.id, 'keep-id');
+eq('元の ID を返す', plan.add[1].oldId, 'keep-id');
+ok('ID の無い形式には新しい ID を振る', plan.add[0].item.id && plan.add[0].oldId === undefined);
+const twice = S.planImport([...[have1, have2], ...plan.add.map(a => a.item)], [{ url: 'https://new.example/1' }, { id: 'keep-id', u: 'https://changed.example/' }], meta);
+eq('同じバックアップを2回読み込んでも増えない', [twice.add.length, twice.dup], [0, 2]);
+
+// PC B に同期で届いた分があるところへ、PC A の全件のバックアップを読み込む（README の「移行」）
+await resetAll();
+const migr = Array.from({ length: 5 }, (_, i) => S.makeItem({ u: `https://migrate.example/${i}`, t: `移行 ${i}` }, meta));
+await putOnBothPcs(migr);
+const backup = (await S.getAll()).items.map(i => ({ ...i }));
+const migratedOnB = await onPcB(async () => {
+  const p = S.planImport((await S.getAll()).items, backup, meta);
+  await S.putItems(p.add.map(a => a.item));
+  return (await S.getAll()).items;
+});
+eq('回帰: 移行先で二重にならない', migratedOnB.length, 5);
+
+console.log('\n--- バックアップの設定を読み込む ---');
+const curS = structuredClone(S.DEFAULT_META.s);
+const san = S.sanitizeSettings({
+  steps: [2, '4', -1, 'x', 8], hour: 25, firstDelay: 3, againMode: 'back', notify: false,
+  syncMax: 0, defaultCat: 'c2', knUrl: 'https://kn.example/kininari.html', knCat: 'メモ',
+  defaultInterval: 7, unknownKey: 'x', badge: 'yes'
+}, curS, { cats: meta.cats, knCats: ['メモ', '調べる'] });
+eq('正の数だけの間隔を取り込む', san.s.steps, [2, 4, 8]);
+eq('範囲外の時刻は丸める', san.s.hour, 23);
+eq('真偽値でない値は取り込まない', san.s.badge, true);
+eq('0 の上限も取り込む', san.s.syncMax, 0);
+ok('知らない項目は取り込まない', !('unknownKey' in san.s));
+eq('変わった項目の一覧', san.changed.sort(), ['againMode', 'defaultCat', 'defaultInterval', 'firstDelay', 'hour', 'knCat', 'knUrl', 'notify', 'steps', 'syncMax'].sort());
+const bad = S.sanitizeSettings({ defaultCat: 'gone', knCat: '勝手な値', knUrl: 'javascript:alert(1)', againMode: 'x', hour: null, steps: [] }, curS, { cats: meta.cats, knCats: ['メモ'] });
+eq('不正な値はどれも取り込まない', bad.changed, []);
+eq('いまの設定と同じなら「変わった」ことにしない', S.sanitizeSettings(curS, curS, { cats: meta.cats, knCats: ['調べる'] }).changed, []);
+eq('設定が無いバックアップでも壊れない', S.sanitizeSettings(null, curS).s, curS);
+
+console.log('\n--- 回帰: 同期オフの「すべて削除」はこの端末だけ ---');
+await resetAll();
+const wipeShared = S.makeItem({ u: 'https://wipe.example/1', t: '両方の PC にある' }, meta);
+await putOnBothPcs([wipeShared]);
+await S.replaceMeta({ ...structuredClone(meta), s: { ...meta.s, sync: false, hour: 7 } });
+eq('同期オフなら scope は local', (await S.wipeAll()).scope, 'local');
+eq('こちらの項目は消える', (await S.getAll()).items.length, 0);
+ok('「すべて削除した」記録を同期に残さない', !(S.WIPE_KEY in syncArea._mem));
+eq('PC B の項目は消えない', (await onPcB(() => S.getAll())).items.map(i => i.id), [wipeShared.id]);
+eq('共有している設定は残す', (await S.getMeta()).s.hour, 7);
+await S.replaceMeta(structuredClone(meta));
+eq('同期オンなら scope は all', (await S.wipeAll()).scope, 'all');
+ok('同期オンなら記録を残す', S.WIPE_KEY in syncArea._mem);
+eq('PC B の項目も消える', (await onPcB(() => S.getAll())).items.length, 0);
+await resetAll();
+
+console.log('\n--- 回帰: YouTube の古いページ情報を使わない ---');
+const YT = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+scriptingResult = { si: 'YouTube', au: '前のチャンネル', du: 'PT1M', title: '前の動画', desc: '前の説明', ogUrl: 'https://www.youtube.com/watch?v=aBcDeFgHiJk', mvid: '' };
+page = await PM.collectPageMeta(1, YT);
+eq('og:url が別の動画ならタイトルを使わない', page.title, '');
+ok('構造化データも古いと見て、チャンネル名・再生時間を使わない', page.rich.au === undefined && page.rich.du === undefined);
+eq('サイト名はそのまま', page.rich.si, 'YouTube');
+scriptingResult = { ...scriptingResult, mvid: 'dQw4w9WgXcQ', au: 'いまのチャンネル', du: 'PT2M' };
+page = await PM.collectPageMeta(1, YT);
+ok('構造化データが今の動画なら、チャンネル名・再生時間は使う', page.rich.au === 'いまのチャンネル' && page.rich.du === 'PT2M' && page.title === '');
+scriptingResult = { ...scriptingResult, ogUrl: 'https://www.youtube.com/', mvid: '' };
+eq('og:url が動画でない（トップから移った）ときもタイトルを使わない', (await PM.collectPageMeta(1, YT)).title, '');
+scriptingResult = { au: 'ch', du: 'PT3M', title: '今の動画', ogUrl: 'https://youtu.be/dQw4w9WgXcQ', mvid: 'dQw4w9WgXcQ' };
+page = await PM.collectPageMeta(1, YT);
+ok('同じ動画ならそのまま使う', page.title === '今の動画' && page.rich.au === 'ch' && page.rich.du === 'PT3M');
+scriptingResult = { title: '記事', au: '著者', ogUrl: 'https://example.com/other' };
+eq('YouTube 以外は og:url を見ない', (await PM.collectPageMeta(1, 'https://example.com/a')).title, '記事');
+scriptingResult = {};
+
+console.log('\n--- 回帰: 送信中に「気になり帳へ送る」を押しても失敗扱いにしない ---');
+await resetAll({ ...structuredClone(knMeta), s: { ...knMeta.s, knOn: true, knUrl: 'https://example.com/kininari.html' } });
+fakeBrowser.reset();
+fakeBrowser.onCreate = () => new Promise(r => setTimeout(r, 150));   // 1件ずつ少し時間がかかる
+const wA = S.makeItem({ u: 'https://wait.example/a', t: '先に送る' }, knMeta);
+const wB = S.makeItem({ u: 'https://wait.example/b', t: 'あとから押す' }, knMeta);
+await S.putItems([wA, wB]);
+await KN.enqueueClip(wA.id);
+const firstRun = KN.flushClips();                   // 即保存などで始まった送信
+await new Promise(r => setTimeout(r, 20));
+await KN.enqueueClip(wB.id);
+eq('待たない呼び出しは busy で戻る', (await KN.flushClips({ force: true })).reason, 'busy');
+const waited = await KN.flushClips({ force: true, wait: true });
+await firstRun;
+ok('待つ呼び出しは、送信中の回が終わってから結果を返す', waited.reason !== 'busy' && waited.left === 0);
+ok('あとから押した項目も送れている', (await S.getAll()).items.find(i => i.id === wB.id).kn > 0);
+fakeBrowser.reset();
+
+console.log('\n--- 送信をオフにしたら再送の予約も止める ---');
+await KN.enqueueClip(wA.id);
+fakeBrowser.alarms.set(KN.RETRY_ALARM, { periodInMinutes: 5 });
+await S.setMeta({ s: { knOn: false } });
+eq('オフなら送らない', (await KN.flushClips({ retry: true })).reason, 'off');
+ok('再送のアラームを止める', !fakeBrowser.alarms.has(KN.RETRY_ALARM));
+await KN.removeFromQueue(wA.id);
+await resetAll();
+
 console.log(`\n${pass} 件成功 / ${fail} 件失敗`);
 process.exit(fail ? 1 : 0);

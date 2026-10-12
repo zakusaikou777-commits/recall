@@ -2,7 +2,7 @@
    Recall — 保存ポップアップ
    ============================================================ */
 import {
-  getAll, putItem, putRich, removeItems, setMeta, makeItem, normalizeUrl, normalizeTags,
+  getAll, putItem, putRich, removeItems, setMeta, makeItem, normalizeUrl, normalizeTags, pickCat,
   domainOf, faviconUrl, fmtDate, isDue, tagCounts, review, resume, isSavableUrl,
   thumbOf, youtubeId, fmtDuration,
   PRESET_INTERVALS, CAT_COLORS, newId, STATUS, STATUS_LABEL, LIMITS, clip
@@ -61,13 +61,14 @@ async function init() {
     renderSavedInfo();
   } else {
     $('title').value = clip(tab.title || url, LIMITS.title);
-    catId = meta.dom[domainOf(url)] || meta.s.defaultCat || 'c0';
+    const remembered = meta.dom[domainOf(url)];
+    catId = pickCat(meta, remembered, meta.s.defaultCat);
     $('iv').value = String(meta.s.defaultInterval || 0);
-    if (meta.dom[domainOf(url)]) $('catHint').textContent = '前回このサイトで使ったカテゴリ';
+    if (remembered && catId === remembered) $('catHint').textContent = '前回このサイトで使ったカテゴリ';
   }
 
   // 保存済みカテゴリが消えている場合は既定に戻す
-  if (!meta.cats.some(c => c.id === catId)) catId = meta.cats[0].id;
+  catId = pickCat(meta, catId, meta.s.defaultCat);
 
   renderCats();
   renderTags();
@@ -418,14 +419,9 @@ async function save() {
       }).catch(() => {});
     }
 
-    // ドメイン→カテゴリの記憶（最近使った順に最大60件）
-    const dom = domainOf(url);
-    const nextDom = { ...meta.dom };
-    delete nextDom[dom];
-    nextDom[dom] = catId;
-    const keys = Object.keys(nextDom);
-    while (keys.length > 60) delete nextDom[keys.shift()];
-    const mres = await setMeta({ dom: nextDom });
+    // ドメイン→カテゴリの記憶（最近使った順に並べ、上限の刈り込みは setMeta が行う）。
+    // このドメインの分だけを渡す（全体を渡すと、ほかの画面・PC で覚えた分の順番まで巻き戻す）
+    const mres = await setMeta({ dom: { [domainOf(url)]: item.c } });
     if (!mres.ok) flash(`保存しました（カテゴリの記憶は失敗: ${mres.error}）`, 'ok');
     else flash(current ? '更新しました' : `保存しました（次の復習: ${fmtDate(item.d)}）`, 'ok');
 

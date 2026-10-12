@@ -299,7 +299,7 @@ export function review(item, result, meta = DEFAULT_META) {
   }
 
   if (it.iv > 0) {
-    // 固定間隔：まだ の場合も同じ間隔で繰り返す
+    // 固定間隔：覚えた → 同じ間隔 / まだ → 間隔の 1/3（最低1日）
     it.d = dueAfterDays(result === 'ok' ? it.iv : Math.max(1, Math.round(it.iv / 3)), set.hour);
     it.s = STATUS.LEARNING;
     return it;
@@ -372,7 +372,14 @@ export async function setMeta(patch) {
     const cur = await getMeta();
     const next = { ...cur, ...patch };
     if (patch.s) next.s = { ...cur.s, ...patch.s };
-    if (patch.dom) next.dom = pruneDom({ ...cur.dom, ...patch.dom });
+    if (patch.dom) {
+      // 使ったドメインは末尾へ付け直す（キーの順番＝最近使った順）。
+      // { ...cur.dom, ...patch.dom } だと最初に登録した位置のままになり、
+      // よく使うサイトほど先に刈り込まれてしまう
+      const dom = { ...cur.dom };
+      for (const [k, v] of Object.entries(patch.dom)) { delete dom[k]; dom[k] = v; }
+      next.dom = pruneDom(dom);
+    }
     await sync().set({ [META_KEY]: next });
     return { ok: true, meta: next };
   } catch (e) {
@@ -393,6 +400,16 @@ export function pruneDom(dom) {
   const out = {};
   for (const k of keys.slice(keys.length - DOM_MAX)) out[k] = dom[k];
   return out;
+}
+
+/**
+ * 候補のうち、いまも存在する最初のカテゴリ id を返す（どれも無ければ先頭のカテゴリ）。
+ * ドメインの記憶や既定のカテゴリは、カテゴリを消したあとも古い id を指していることがある。
+ */
+export function pickCat(meta, ...candidates) {
+  const cats = (meta && Array.isArray(meta.cats) && meta.cats.length) ? meta.cats : DEFAULT_META.cats;
+  for (const id of candidates) if (id && cats.some(c => c.id === id)) return id;
+  return cats[0].id;
 }
 
 /** meta 全体を丸ごと置き換える（設定ダイアログのように全体を編集した場合のみ） */
@@ -656,6 +673,14 @@ export async function putRich(id, rich) {
   catch (e) { return { ok: false, error: describeLocalError(e) }; }
 }
 
+/** 同期する件数の上限。0 も有効な値（|| で既定値にすると 0 が 300 に化ける） */
+export function syncMaxOf(meta) {
+  const raw = meta && meta.s ? meta.s.syncMax : undefined;
+  const n = Number(raw);
+  if (raw == null || raw === '' || !Number.isFinite(n)) return DEFAULT_META.s.syncMax;
+  return Math.max(0, Math.round(n));
+}
+
 /** sync 側を「更新が新しい順に、上限まで」載せ直す */
 export async function syncPush() {
   try {
@@ -682,7 +707,7 @@ export async function syncPush() {
     const want = [];
     if (meta.s.sync !== false) {
       const sorted = [...all].sort((a, b) => (b.up || b.cr || 0) - (a.up || a.cr || 0));
-      const maxCount = Math.min(Math.max(0, Number(meta.s.syncMax) || 300), SYNC_MAX_ITEMS - otherKeys - 1);
+      const maxCount = Math.min(syncMaxOf(meta), SYNC_MAX_ITEMS - otherKeys - 1);
       let bytes = 0;
       for (const it of sorted) {
         if (want.length >= maxCount) break;
@@ -762,18 +787,106 @@ export async function restoreItems(list, richMap) {
   return putItems(list.map(i => ({ ...i })), richMap);
 }
 
-/** すべて消す（設定ダイアログの「すべて削除」） */
+/**
+ * すべて消す（設定ダイアログの「すべて削除」）。
+ * 同期オン … ほかの PC の項目と設定も消す（「すべて削除した」時刻を同期に残す）
+ * 同期オフ … この端末の項目だけを消す。1件ずつの削除と同じく、ほかの PC には伝えない
+ *            （設定は同期で共有しているので残す）
+ * @returns {{ok: boolean, scope: 'all'|'local'}}
+ */
 export async function wipeAll() {
-  // 先に sync を空にする。逆順だと、消している最中に別のコンテキスト（Service Worker）が
+  let syncOn = true;
+  try { syncOn = (await getMeta()).s.sync !== false; } catch { /* 読めなければ従来どおり全部消す */ }
+  // 先に sync 側を片付ける。逆順だと、消している最中に別のコンテキスト（Service Worker）が
   // getAll() を呼び、sync に残っていた項目を local へ取り込み直してしまう。
-  try { await sync().clear(); } catch { /* 続行 */ }
+  if (syncOn) {
+    try { await sync().clear(); } catch { /* 続行 */ }
+  } else {
+    try {
+      const ss = await sync().get(null);
+      const keys = Object.keys(ss).filter(k => k.startsWith(ITEM_PREFIX));
+      if (keys.length) await sync().remove(keys);
+    } catch { /* 続行 */ }
+  }
   try { await local().clear(); } catch { /* 続行 */ }
   await new Promise(r => setTimeout(r, 250));
   try { await local().clear(); } catch { /* 続行 */ }   // 取り込みが競合した場合の念のため
   // 「すべて削除した」ことを同期にも残す。これが無いと、他の PC に残っていた項目が
   // 次の同期でそっくり戻ってきてしまう（削除の記録は消してしまったので効かない）。
-  try { await sync().set({ [WIPE_KEY]: Date.now() }); } catch { /* 続行 */ }
-  return { ok: true };
+  if (syncOn) { try { await sync().set({ [WIPE_KEY]: Date.now() }); } catch { /* 続行 */ } }
+  return { ok: true, scope: syncOn ? 'all' : 'local' };
+}
+
+/* ---------- 読み込み（バックアップの復元） ---------- */
+
+/**
+ * 読み込む項目を、いまある項目と突き合わせる（純粋な関数：テストしやすい）。
+ * 同じ ID か同じページ（正規化した URL）がすでにあるものは取り込まない。
+ * 同期で届いた分がある PC にバックアップを読み込むと、そのぶんが二重になり、
+ * 二重になった分は更新が新しいので同期に載って元の PC にも広がってしまうため。
+ * @returns {{add: Array<{item: object, oldId: *}>, dup: number, invalid: number}}
+ */
+export function planImport(existing, incoming, meta) {
+  const ids = new Set((existing || []).map(i => String(i.id)));
+  const urls = new Set((existing || []).map(i => normalizeUrl(i.u)));
+  const add = [];
+  let dup = 0, invalid = 0;
+  for (const raw of (Array.isArray(incoming) ? incoming : [])) {
+    // http/https で始まらないもの（URL が無い・javascript: など）は読み込まない。
+    // URL が無いと一覧に出ないのに件数にだけ数えられ、消すこともできなくなる
+    if (!raw || typeof raw !== 'object') { invalid++; continue; }
+    const hadId = raw.id != null && raw.id !== '';
+    const item = makeItem(raw, meta);
+    if (!isSavableUrl(item.u)) { invalid++; continue; }
+    const key = normalizeUrl(item.u);
+    if ((hadId && ids.has(String(item.id))) || urls.has(key)) { dup++; continue; }
+    while (ids.has(String(item.id))) item.id = newId();   // ID の無い形式で採番した分の衝突よけ
+    ids.add(String(item.id));
+    urls.add(key);
+    add.push({ item, oldId: raw.id });
+  }
+  return { add, dup, invalid };
+}
+
+/**
+ * バックアップの設定を、いまの設定に重ねる（純粋な関数）。知っている項目だけを、型と範囲を確かめて取り込む。
+ * @param {object} raw バックアップの meta.s
+ * @param {object} cur いまの meta.s
+ * @param {{cats?: Array, knCats?: string[]}} [opts] 既定のカテゴリ・気になり帳のカテゴリとして選べるもの
+ * @returns {{s: object, changed: string[]}}
+ */
+export function sanitizeSettings(raw, cur, opts = {}) {
+  const s = { ...cur };
+  const changed = [];
+  if (!raw || typeof raw !== 'object') return { s, changed };
+  const num = (v, min, max) => {
+    const n = Number(v);
+    return (v === null || v === '' || typeof v === 'boolean' || !Number.isFinite(n)) ? undefined : Math.min(max, Math.max(min, Math.round(n)));
+  };
+  const take = (k, v) => {
+    if (v === undefined) return;
+    if (JSON.stringify(v) !== JSON.stringify(s[k])) changed.push(k);
+    s[k] = v;
+  };
+  if (Array.isArray(raw.steps)) {
+    const steps = raw.steps.map(Number).filter(n => Number.isFinite(n) && n > 0).map(n => Math.min(3650, Math.round(n))).slice(0, 12);
+    if (steps.length) take('steps', steps);
+  }
+  for (const k of ['notify', 'badge', 'sync', 'thumbs', 'embed', 'knOn']) {
+    if (typeof raw[k] === 'boolean') take(k, raw[k]);
+  }
+  take('hour', num(raw.hour, 0, 23));
+  take('firstDelay', num(raw.firstDelay, 0, 365));
+  take('defaultInterval', num(raw.defaultInterval, 0, 3650));
+  take('syncMax', num(raw.syncMax, 0, 500));
+  if (raw.againMode === 'reset' || raw.againMode === 'back') take('againMode', raw.againMode);
+  if (typeof raw.defaultCat === 'string' && (opts.cats || []).some(c => c.id === raw.defaultCat)) take('defaultCat', raw.defaultCat);
+  if (typeof raw.knUrl === 'string') {
+    const u = clip(raw.knUrl, 300);
+    if (!u || /^https?:\/\//i.test(u)) take('knUrl', u);   // 送り先は http/https だけ
+  }
+  if (typeof raw.knCat === 'string' && (opts.knCats || []).includes(raw.knCat)) take('knCat', raw.knCat);
+  return { s, changed };
 }
 
 /** Chrome が数えるのと同じ「キー名 + JSON 文字列」の UTF-8 バイト数 */

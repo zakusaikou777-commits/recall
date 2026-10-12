@@ -40,14 +40,35 @@ export function readPageMeta() {
     if (t && t.textContent) duration = t.textContent.trim();
   }
 
+  // 画面を切り替えても head を書き直さないサイト（YouTube など）で、
+  // 値が「いま見ているページ」のものかを外側で確かめるための手がかり
+  const micro = document.querySelector('meta[itemprop="videoId"]')
+    || document.querySelector('meta[itemprop="identifier"]');
+
   return {
     th: abs(image),
     si: attr('meta[property="og:site_name"]'),
     au: author,
     du: duration,
     title: attr('meta[property="og:title"]') || document.title || '',
-    desc: attr('meta[property="og:description"]') || attr('meta[name="description"]') || ''
+    desc: attr('meta[property="og:description"]') || attr('meta[name="description"]') || '',
+    ogUrl: abs(attr('meta[property="og:url"]')),
+    mvid: micro ? (micro.getAttribute('content') || '') : ''
   };
+}
+
+/**
+ * YouTube は動画を切り替えても head の og: やページ内の構造化データを書き直さないことがあり、
+ * 前に見ていた動画のタイトル・チャンネル名・再生時間が残る。
+ * 「別のページのものだ」と分かる値だけを捨てる（手がかりが無いときはそのまま使う）。
+ */
+export function dropStaleYoutube(r, vid) {
+  const out = { ...r };
+  const ogStale = !!r.ogUrl && youtubeId(r.ogUrl) !== vid;
+  const microStale = r.mvid ? r.mvid !== vid : ogStale;
+  if (ogStale) { out.title = ''; out.desc = ''; }
+  if (microStale) { out.au = ''; out.du = ''; }
+  return out;
 }
 
 /**
@@ -60,7 +81,8 @@ export async function collectPageMeta(tabId, url) {
   try {
     if (!chrome.scripting || tabId == null) return empty;
     const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: readPageMeta });
-    const r = (res && res.result) || {};
+    let r = (res && res.result) || {};
+    if (vid) r = dropStaleYoutube(r, vid);
     const rich = {};
     // YouTube のサムネイルは ID から導けるので保存しない（容量の節約）
     if (!vid && r.th && /^https?:\/\//i.test(r.th)) rich.th = clip(r.th, RICH_LIMITS.th);

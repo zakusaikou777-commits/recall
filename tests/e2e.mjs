@@ -566,6 +566,8 @@ await lib.uncheck('#sKnOn');
 await lib.locator('#setDlg button[value=close]').click();
 await lib.waitForTimeout(2200);
 ok('オフに戻せる', (await lib.evaluate(async () => (await chrome.storage.sync.get('meta')).meta.s.knOn)) === false);
+// ブラウザがつなぎっぱなしにしている接続があると close が終わらないので、先に切る
+knServer.closeAllConnections();
 await new Promise(r => knServer.close(r));
 
 section('回帰: 画面の細かい不具合');
@@ -788,18 +790,30 @@ const exported = await lib.evaluate(async () => {
 });
 ok('書き出しにサムネイル情報が含まれる', Object.keys(exported.rich).length > 0);
 
-await lib.click('#btnSettings'); await lib.waitForTimeout(400);
-await lib.setInputFiles('#impFile', {
-  name: 'with-rich.json', mimeType: 'application/json',
-  buffer: Buffer.from(JSON.stringify(exported))
-});
-await lib.waitForTimeout(2500);
-await lib.locator('#setDlg button[value=close]').click();
+const importFile = async (name, payload) => {
+  await lib.click('#btnSettings'); await lib.waitForTimeout(400);
+  await lib.setInputFiles('#impFile', { name, mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(payload)) });
+  await lib.waitForTimeout(2500);
+  const msg = await lib.locator('#setMsg').innerText();
+  await lib.locator('#setDlg button[value=close]').click();
+  await lib.waitForTimeout(800);
+  return msg;
+};
+// 回帰: 以前は同じ項目を別の ID で読み込み直し、すべて二重になっていた
+const dupMsg = await importFile('same.json', exported);
+eq2('回帰: 同じバックアップを読み込んでも二重にならない', (await readItems()).length, exported.items.length);
+ok('すでにある分は読み込まなかったと知らせる', dupMsg.includes('すでに保存してある'));
+// 端末から消えた状態（入れ直し・別の PC）で読み込むと、サムネイル情報ごと戻る
+await lib.evaluate(async (ids) => {
+  await chrome.storage.sync.remove(ids.map(id => 'i:' + id));
+  await chrome.storage.local.remove(ids.flatMap(id => ['L:' + id, 'R:' + id]));
+}, exported.items.map(i => i.id));
 await lib.waitForTimeout(800);
+await importFile('with-rich.json', exported);
 const richCount = await lib.evaluate(async () =>
   Object.keys(await chrome.storage.local.get(null)).filter(k => k.startsWith('R:')).length);
-ok('読み込むとサムネイル情報も復元される（ID が振り直されても追従）',
-  richCount >= Object.keys(exported.rich).length * 2);
+ok('読み込むとサムネイル情報も復元される', richCount >= Object.keys(exported.rich).length);
+eq2('件数も元どおり', (await readItems()).length, exported.items.length);
 await lib.waitForTimeout(2500);   // 設定ダイアログを閉じたあとの同期処理が終わるのを待つ
 
 await lib.click('#btnSettings'); await lib.waitForTimeout(400);
@@ -808,7 +822,7 @@ await lib.setInputFiles('#impFile', {
   buffer: Buffer.from(JSON.stringify(importRes.payload))
 });
 await lib.waitForTimeout(2500);
-ok('読み込み結果が表示される', /読み込みました|中断/.test(await lib.locator('#setMsg').innerText()));
+ok('読み込み結果が表示される', /読み込みました|読み込みませんでした|中断/.test(await lib.locator('#setMsg').innerText()));
 const catIds = await lib.evaluate(async () => (await chrome.storage.sync.get('meta')).meta.cats.map(c => c.id));
 ok('回帰: 不正な id のカテゴリは取り込まない', !catIds.some(c => c.includes('<')));
 const allAfter = await readItems();
@@ -1126,6 +1140,75 @@ await waitUntil(async () => lib.locator('#toastUndo').isVisible());
 ok('回帰: 未確認の送信でも「気になり帳に残ります」と出す', (await toastText()).includes('気になり帳に送った分は'));
 await lib.click('#toastUndo');
 await waitUntil(async () => (await itemCount()) === 1);
+
+section('回帰: 1.8.2');
+await freshStore();
+await seedItems(3, { prefix: 'sp', title: '集中S', due: true });
+await openLib('review');
+await lib.click('#startReview'); await lib.waitForTimeout(600);
+const fTitle = () => lib.locator('#fTitle').innerText().then(t => t.trim());
+const t1 = await fTitle();
+await lib.click('#fLater');                                   // マウスで「あとで」→ フォーカスがボタンに残る
+await waitUntil(async () => (await fTitle()) !== t1);
+await lib.waitForTimeout(600);
+const t2 = await fTitle();
+await lib.keyboard.press(' ');
+await waitUntil(async () => (await fTitle()) !== t2, 5000);
+await lib.waitForTimeout(WAIT);
+const byTitle = async (t) => (await readItems()).find(i => i.t === t) || {};
+eq2('回帰: 集中復習の Space は「覚えた」（段位が1つ上がる）', (await byTitle(t2)).b, 2);
+eq2('直前に押した「あとで」が次の項目にかからない', (await byTitle(t1)).b, 1);
+await lib.keyboard.press('Escape'); await lib.waitForTimeout(400);
+
+// 編集ダイアログの URL
+await openLib('all');
+const editCard = lib.locator('#list .card').first();
+const editTitle = (await editCard.locator('a.title').innerText()).trim();
+const editTarget = await byTitle(editTitle);
+const otherUrl = (await readItems()).find(i => i.id !== editTarget.id).u;
+await editCard.locator('button', { hasText: '編集' }).click(); await lib.waitForTimeout(400);
+await lib.fill('#eUrl', 'javascript:alert(1)');
+await lib.click('#eSave'); await lib.waitForTimeout(500);
+ok('回帰: http(s) 以外の URL では保存しない（ダイアログが閉じない）', await lib.locator('#editDlg').evaluate(d => d.open));
+const reopenEdit = async () => {   // 閉じてしまった（＝不具合）ときも、止まらずに次を確かめる
+  if (await lib.locator('#editDlg').evaluate(d => d.open)) return;
+  await lib.locator('#list .card', { hasText: editTitle }).first().locator('button', { hasText: '編集' }).click();
+  await lib.waitForTimeout(400);
+};
+await reopenEdit();
+await lib.fill('#eUrl', otherUrl);
+await lib.click('#eSave'); await lib.waitForTimeout(500);
+ok('回帰: ほかの項目と同じページには書き換えない', await lib.locator('#editDlg').evaluate(d => d.open));
+await reopenEdit();
+await lib.fill('#eUrl', 'https://regress.example/edited');
+await lib.click('#eSave'); await lib.waitForTimeout(WAIT);
+ok('正しい URL なら保存して閉じる', !(await lib.locator('#editDlg').evaluate(d => d.open)));
+eq2('URL が書き換わる', (await readItems()).find(i => i.id === editTarget.id).u, 'https://regress.example/edited');
+
+// お気に入りのダブルクリック
+await openLib('all');
+const starCard = lib.locator('#list .card').first();
+const starTitle = (await starCard.locator('a.title').innerText()).trim();
+await dblClick(starCard.locator('button.star'));
+await lib.waitForTimeout(WAIT);
+eq2('回帰: ★ のダブルクリックで2回切り替わらない', (await byTitle(starTitle)).f, 1);
+
+// 即保存: 覚えているカテゴリが消されていたら既定のカテゴリへ
+await lib.evaluate(async () => {
+  const m = (await chrome.storage.sync.get('meta')).meta || {};
+  await chrome.storage.sync.set({ meta: { ...m, dom: { ...(m.dom || {}), 'quick.example': 'cGone' } } });
+});
+await lib.waitForTimeout(500);
+const qs = await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'quickSave', url: 'https://quick.example/page', title: '即保存', tabId: null }));
+ok('即保存できる', qs && qs.ok);
+eq2('回帰: 消えたカテゴリには入れない', qs && qs.item && qs.item.c, 'c0');
+
+// 同期する件数の上限 0
+await lib.click('#btnSettings'); await lib.waitForTimeout(400);
+await lib.fill('#sSyncMax', '0');
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(WAIT);
+eq2('回帰: 同期する件数の上限を 0 にできる', (await lib.evaluate(async () => (await chrome.storage.sync.get('meta')).meta.s.syncMax)), 0);
+eq2('上限 0 なら同期に載らない', await countSynced(), 0);
 
 section('後片付け');
 const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));
