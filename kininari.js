@@ -275,22 +275,37 @@ function startClipAwait(url) {
   return new Promise(resolve => { startClip(url, resolve); });
 }
 
-let flushing = false;
+let running = null;   // 送信中の回（Promise）。裏タブは一度に1つしか開かない
 
 /**
  * 待ち行列を順番に送る。裏タブは一度に1つしか開かない。
  * opts.force … 手動の「今すぐ送る」など。試行回数の上限と間隔を無視する
  * opts.retry … 5分ごとの再送アラーム。間隔（RETRY_GAP_MS）は無視するが上限は守る
+ * opts.wait  … 送信中の回があれば、終わるのを待ってからもう一度送る（結果を画面に出す操作用）。
+ *              待たないと「送れませんでした」と出るのに、実は送信中の回が送っている、ということが起きる
  * @returns {{ok:boolean, sent:number, left:number, reason?:string}}
  */
 export async function flushClips(opts) {
-  if (flushing) return { ok: true, sent: 0, left: (await getQueue()).length, reason: 'busy' };
-  flushing = true;
+  if (running) {
+    if (!(opts && opts.wait)) return { ok: true, sent: 0, left: (await getQueue()).length, reason: 'busy' };
+    await running.catch(() => {});
+    return flushClips(opts);
+  }
+  // 終わったときには running が空になっているようにする（待っていた側がすぐ次を始められる）
+  running = (async () => {
+    try { return await flushOnce(opts); } finally { running = null; }
+  })();
+  return running;
+}
+
+async function flushOnce(opts) {
   try {
     if (!(await getQueue()).length) { await clearRetryAlarm(); return { ok: true, sent: 0, left: 0 }; }
 
     const first = await getAll();
     if (!clipEnabled(first.meta)) {
+      // オフの間は再送アラームも止める（オンに戻したときは設定の変更をきっかけに送り直す）
+      await clearRetryAlarm();
       return { ok: false, sent: 0, left: (await getQueue()).length, reason: 'off' };
     }
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
@@ -352,8 +367,6 @@ export async function flushClips(opts) {
     return { ok: true, sent, left: left.length, done };
   } catch (e) {
     return { ok: false, sent: 0, left: (await getQueue()).length, reason: String((e && e.message) || e) };
-  } finally {
-    flushing = false;
   }
 }
 

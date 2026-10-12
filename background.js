@@ -6,7 +6,7 @@
 import {
   getAll, putItem, putItems, makeItem, findByUrl,
   getLastNotified, setLastNotified, syncPush,
-  isDue, domainOf, isSavableUrl, setMeta, META_KEY, ITEM_PREFIX, LOCAL_PREFIX
+  isDue, domainOf, isSavableUrl, setMeta, pickCat, META_KEY, ITEM_PREFIX, LOCAL_PREFIX
 } from './store.js';
 import { collectPageMeta } from './pagemeta.js';
 import {
@@ -37,29 +37,44 @@ chrome.runtime.onStartup.addListener(setup);
 
 // Service Worker はイベントのたびに起こされて 30 秒ほどで停止する。
 // onInstalled / onStartup が来ない再起動（拡張の再有効化など）でも
-// アラームと右クリックメニューが必ず復活するよう、読み込み時にも実行する。
-setup().catch(e => console.warn('[Recall] setup failed', e));
+// アラームと右クリックメニューが必ず復活するよう、読み込み時にも見る。
+// ただし準備は「ブラウザの起動・拡張の読み込み」ごとに1回で足りる（session に印を置く）。
+// タブの更新などで起こされるたびに全部やり直すと、そのつど全データを読み直すことになる。
+const SETUP_KEY = 'rcSetupDone';
+let setupRun = null;
+(async () => {
+  let done = false;
+  try { done = !!(await chrome.storage.session.get(SETUP_KEY))[SETUP_KEY]; } catch { /* 分からなければ準備する */ }
+  if (done) await ensureAlarm();
+  else await setup();
+})().catch(e => console.warn('[Recall] setup failed', e));
 sweepClips().catch(() => {});   // 起こされたときのクリップ取り残し点検
 
-let setupDone = false;
-async function setup() {
+/** 準備。onStartup と読み込み時の両方から呼ばれても、同じ Service Worker の中では1回だけ走らせる */
+function setup() {
+  if (!setupRun) setupRun = runSetup();
+  return setupRun;
+}
+
+async function runSetup() {
   try {
     await ensureAlarm();
     await buildMenus();
-    setupDone = true;
     await refresh();
     await adoptRestoredClipTabs();   // 復元された裏タブを引き取る
     await sweepClips();
     // 起動時の設定を控えておく（次に変わったときだけ再送のきっかけにする）
     try { await writeClipCfg(clipCfgOf((await getAll()).meta)); } catch { /* 続行 */ }
     await flushClips();              // 前回送れなかった分を送り直す
+    try { await chrome.storage.session.set({ [SETUP_KEY]: true }); } catch { /* 次に起きたときにやり直すだけ */ }
   } catch (e) {
     console.warn('[Recall] setup error', e);
   }
 }
 
 async function ensureAlarm() {
-  // create は同名なら上書きなので冪等
+  // 同名で create すると予定が「1分後」に引き直されるので、無いときだけ作る
+  try { if (await chrome.alarms.get(TICK)) return; } catch { /* 作り直す */ }
   await chrome.alarms.create(TICK, { periodInMinutes: 30, delayInMinutes: 1 });
 }
 
@@ -106,7 +121,9 @@ async function sendToKininari(itemId, sendResponse) {
     sendResponse({ ok: false, status: 'full', message: '未送信が多すぎます。先に「今すぐ送る」で片付けてください。' });
     return;
   }
-  const res = await flushClips({ force: true });
+  // 別の送信が進んでいる最中なら、それが終わるのを待ってから送る
+  //（すぐ戻ると、実際には送れるのに「送れませんでした」と出てしまう）
+  const res = await flushClips({ force: true, wait: true });
 
   // 「待ち行列に無い＝送れた」ではなく、項目に印が付いたかどうかで判断する
   const after = (await getAll()).items.find(i => i.id === itemId);
@@ -234,7 +251,8 @@ async function quickSave(url, title, tabId) {
 
   const { meta } = await getAll();
   const dom = domainOf(url);
-  const cat = meta.dom[dom] || meta.s.defaultCat || 'c0';
+  // 覚えているカテゴリが消されていたら既定のカテゴリへ（消したカテゴリに入ると、どの一覧にも出なくなる）
+  const cat = pickCat(meta, meta.dom[dom], meta.s.defaultCat);
   const page = await collectPageMeta(tabId, url);      // サムネイル・サイト名・著者
   const item = makeItem({
     u: url, t: title || page.title || url, c: cat, iv: meta.s.defaultInterval || 0
@@ -284,7 +302,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === 'sendToKininari') { sendToKininari(msg.id, sendResponse); return true; }
   if (msg && msg.type === 'clipQueue') { queueSummary().then(sendResponse); return true; }
   if (msg && msg.type === 'clipFlush') {
-    resetQueueTries().then(() => flushClips({ force: true })).then(sendResponse);
+    resetQueueTries().then(() => flushClips({ force: true, wait: true })).then(sendResponse);
     return true;
   }
   if (msg && msg.type === 'clipForget') { removeFromQueue(msg.id).then(() => sendResponse({ ok: true })); return true; }
