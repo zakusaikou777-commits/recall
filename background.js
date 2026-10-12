@@ -6,7 +6,8 @@
 import {
   getAll, putItem, putItems, makeItem, findByUrl,
   getLastNotified, setLastNotified, syncPush,
-  isDue, domainOf, isSavableUrl, setMeta, pickCat, META_KEY, ITEM_PREFIX, LOCAL_PREFIX
+  isDue, domainOf, isSavableUrl, setMeta, getMeta, pickCat,
+  META_KEY, ITEM_PREFIX, LOCAL_PREFIX, RICH_PREFIX, LOCAL_TOMBS_KEY, WIPE_KEY
 } from './store.js';
 import { collectPageMeta } from './pagemeta.js';
 import {
@@ -14,6 +15,9 @@ import {
   enqueueClip, flushClips, queueSummary, resetQueueTries, removeFromQueue,
   clipEnabled, clipStateOf, CLIP_ALARM, RETRY_ALARM, CLIP_MESSAGE
 } from './kininari.js';
+import {
+  syncDrive, connectDrive, disconnectDrive, driveStatus, listBackups, getBackup, DRIVE_ALARM
+} from './drive.js';
 
 const TICK = 'recall-tick';
 const NOTIF_ID = 'recall-due';
@@ -66,6 +70,7 @@ async function runSetup() {
     // 起動時の設定を控えておく（次に変わったときだけ再送のきっかけにする）
     try { await writeClipCfg(clipCfgOf((await getAll()).meta)); } catch { /* 続行 */ }
     await flushClips();              // 前回送れなかった分を送り直す
+    await syncDrive();               // Google ドライブの最新を取り込む（オフなら何もしない）
     try { await chrome.storage.session.set({ [SETUP_KEY]: true }); } catch { /* 次に起きたときにやり直すだけ */ }
   } catch (e) {
     console.warn('[Recall] setup error', e);
@@ -94,7 +99,8 @@ function buildMenus() {
 /* ---------- 期限チェック ---------- */
 
 chrome.alarms.onAlarm.addListener(async (a) => {
-  if (a.name === TICK) await refresh();
+  if (a.name === TICK) { await refresh(); await syncDrive(); }   // ドライブ同期も30分ごとに確かめる
+  if (a.name === DRIVE_ALARM) await syncDrive();                 // 変更のあと少し待ってから送る
   if (a.name === CLIP_ALARM) await sweepClips();
   if (a.name === RETRY_ALARM) await flushClips({ retry: true });   // 送れなかった分の再送（5分ごと）
 });
@@ -170,10 +176,26 @@ async function onClipConfigMaybeChanged() {
   await flushClips();
 }
 
+/**
+ * 項目・削除の記録・カテゴリが変わったら、1分ほどあとに Google ドライブへ送る。
+ * 続けて変わっても予約は1つだけ（無いときだけ作る）なので、まとめて1回で送られる。
+ */
+async function scheduleDriveSync() {
+  try {
+    if (!(await getMeta()).s.driveOn) return;
+    if (await chrome.alarms.get(DRIVE_ALARM)) return;
+    await chrome.alarms.create(DRIVE_ALARM, { delayInMinutes: 1 });
+  } catch { /* 30分ごとの確認で送られる */ }
+}
+
 let refreshTimer = null;
 chrome.storage.onChanged.addListener((changes, areaName) => {
   const keys = Object.keys(changes);
   const touched = keys.some(k => k.startsWith(ITEM_PREFIX) || k.startsWith(LOCAL_PREFIX));
+  if ((areaName === 'local' && keys.some(k => k.startsWith(LOCAL_PREFIX) || k.startsWith(RICH_PREFIX) || k === LOCAL_TOMBS_KEY))
+    || (areaName === 'sync' && (keys.includes(META_KEY) || keys.includes(WIPE_KEY)))) {
+    scheduleDriveSync();
+  }
   // 設定の変更は「再計算」より先に見る（下の早期 return に隠れないように）
   if (keys.includes(META_KEY)) onClipConfigMaybeChanged();
   // meta だけの変更（設定保存など）では再計算しない → 自分の書き込みで再入しない
@@ -316,6 +338,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg && msg.type === 'openLibrary') { openLibrary(msg.hash || ''); sendResponse({ ok: true }); return false; }
+  // Google ドライブ同期（設定画面から）
+  if (msg && msg.type === 'driveStatus') { driveStatus().then(sendResponse); return true; }
+  if (msg && msg.type === 'driveConnect') { connectDrive().then(sendResponse); return true; }
+  if (msg && msg.type === 'driveSync') { syncDrive({ force: !msg.soft }).then(sendResponse); return true; }
+  if (msg && msg.type === 'driveDisconnect') { disconnectDrive().then(sendResponse); return true; }
+  if (msg && msg.type === 'driveBackups') { listBackups().then(sendResponse); return true; }
+  if (msg && msg.type === 'driveBackupGet') { getBackup(msg.id).then(sendResponse); return true; }
   return false;
 });
 

@@ -43,7 +43,7 @@ for (const [name, c] of Object.entries(manifest.commands || {})) {
 if (manifest.omnibox && !manifest.omnibox.keyword) fail('manifest.json', 'omnibox の keyword が空です');
 
 /* ---------- 対象ファイル ---------- */
-const JS = ['store.js', 'pagemeta.js', 'changelog.js', 'background.js', 'popup.js', 'library.js'];
+const JS = ['store.js', 'pagemeta.js', 'changelog.js', 'background.js', 'popup.js', 'library.js', 'drive.js'];
 const HTML = ['popup.html', 'library.html'];
 const src = Object.fromEntries([...JS, ...HTML].map(f => [f, read(f)]));
 
@@ -153,7 +153,7 @@ const perms = new Set(manifest.permissions || []);
 const NEEDS = {
   'chrome.storage': 'storage', 'chrome.alarms': 'alarms', 'chrome.notifications': 'notifications',
   'chrome.contextMenus': 'contextMenus', 'chrome.tabs.query': 'tabs', '_favicon': 'favicon',
-  'chrome.scripting': 'scripting'
+  'chrome.scripting': 'scripting', 'chrome.identity': 'identity'
 };
 const allJs = JS.map(f => src[f]).join('\n');
 for (const [api, perm] of Object.entries(NEEDS)) {

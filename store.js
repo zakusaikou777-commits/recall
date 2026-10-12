@@ -13,6 +13,7 @@ export const TOMB_PREFIX = 'del';         // sync: 削除の記録の本体（de
 export const TOMB_SHARDS = 10;            // 分ける数の上限（1キー 8KB × 10 ≒ 3000 件）
 export const TOMB_SHARD_BYTES = 8000;     // 1キーあたりの目安（上限 8192 バイトに余白を残す）
 export const WIPE_KEY = 'wipe';           // sync: 「すべて削除」した時刻（他の端末にも伝える）
+export const LOCAL_TOMBS_KEY = 'rcTombs'; // local: この端末で消した・消えたと知った記録 {id: 時刻}（Google ドライブ同期で伝える）
 export const SYNC_BUDGET_BYTES = 80000;   // 同期に使う上限（100KB のうち meta などの余白を残す）
 export const SYNC_HEADROOM = 8192;        // 削除の記録が増えても meta を書けるように空けておく分
 export const DEL_KEEP_DAYS = 60;
@@ -69,7 +70,8 @@ export const DEFAULT_META = {
     embed: true,         // YouTube をその場で再生できるようにする
     knOn: false,         // 保存したページを気になり帳にも送る
     knUrl: '',           // 気になり帳（kininari.html）の URL
-    knCat: '調べる'      // 気になり帳側のカテゴリ
+    knCat: '調べる',     // 気になり帳側のカテゴリ
+    driveOn: false       // Google ドライブで同期する（つないだ PC 同士で全件を共有する）
   },
   lastNotified: 0   // 後方互換のため残しているが、実際は chrome.storage.local を使う
 };
@@ -571,18 +573,40 @@ async function writeTombs(ss, tombs, keep, gone = [], ids = []) {
 }
 
 /** 項目の「最後に触った時刻」。旧バージョンの項目には up が無いので保存時刻で代用する */
-function stampOf(v) {
+export function stampOf(v) {
   return Number(v && (v.up || v.cr)) || 0;
 }
 
 /** その項目が削除済みか（個別の削除、または「すべて削除」より前の内容か） */
-function isDeleted(id, stamp, tombAt, wipedAt) {
+export function isDeleted(id, stamp, tombAt, wipedAt) {
   const t = tombAt.get(String(id));
   if (t && stamp <= t) return true;
   // 「すべて削除」と同じミリ秒に保存された項目は残す側に倒す
   //（消しすぎるより、消え残る方が取り返しがつく）
   if (wipedAt && stamp < wipedAt) return true;
   return false;
+}
+
+/**
+ * 端末に持っている削除の記録（Google ドライブ同期用）を、60日を過ぎたものを除いて返す。
+ * 同期（Chrome）の記録とは別に持つ。同期をオフにしていても、ドライブでつないだ PC へは削除を伝えるため。
+ */
+export function readLocalTombs(ls, now = Date.now()) {
+  const out = {};
+  const raw = ls && ls[LOCAL_TOMBS_KEY];
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [id, t] of Object.entries(raw)) {
+    const n = Number(t);
+    if (n > 0 && now - n < DEL_KEEP_DAYS * DAY_MS) out[id] = n;
+  }
+  return out;
+}
+
+/** 同期（Chrome）の削除の記録と、端末の削除の記録を合わせた表 */
+export function allTombs(ls, ss) {
+  const m = readTombs(ss);
+  for (const [id, t] of Object.entries(readLocalTombs(ls))) if (t > (m.get(id) || 0)) m.set(id, t);
+  return m;
 }
 
 /** 全項目 + 設定 + 付随情報を読み出し、同期で降ってきた変更を取り込む */
@@ -599,7 +623,8 @@ export async function getAll() {
 
   // 削除の記録を先に読む。取り込みより後に見ると
   // 「取り込む → 消す」を毎回くり返して書き込みが止まらなくなる。
-  const tombAt = readTombs(ss);
+  // 端末の記録（ドライブ経由で知った削除）も見る。見ないと、同期に残っていた写しを取り込み直してしまう
+  const tombAt = allTombs(ls, ss);
   const wipedAt = Number(ss[WIPE_KEY]) || 0;
 
   // 他の PC で保存・更新されたものを取り込む（削除済みのものは取り込まない）
@@ -686,7 +711,7 @@ export async function syncPush() {
   try {
     const [ls, ss] = await Promise.all([local().get(null), sync().get(null)]);
     const meta = mergeMeta(ss[META_KEY]);
-    const tombAt = readTombs(ss);
+    const tombAt = allTombs(ls, ss);
     const wipedAt = Number(ss[WIPE_KEY]) || 0;
     const all = Object.entries(ls)
       .filter(([k, v]) => k.startsWith(LOCAL_PREFIX) && v && v.u)
@@ -753,11 +778,18 @@ export async function removeItems(ids) {
     await withTombLock(async () => {
       const ss = await sync().get(null);
       const gone = ids.map(id => ITEM_PREFIX + id);
+      const set = mergeMeta(ss[META_KEY]).s;
+      const now = Date.now();
+      // Google ドライブでつないでいるときは、端末にも記録を残す（次の同期でドライブとほかの PC へ伝える）
+      if (set.driveOn) {
+        const lt = readLocalTombs(await local().get(LOCAL_TOMBS_KEY), now);
+        for (const id of ids) lt[String(id)] = now;
+        await local().set({ [LOCAL_TOMBS_KEY]: lt });
+      }
       // 同期オフ（この端末のみ）のときは記録を残さない。
       // 残すと、同期していた頃から他の PC にある同じ項目まで消してしまい、元に戻すでも戻らない
-      if (mergeMeta(ss[META_KEY]).s.sync === false) { await sync().remove(gone); return; }
+      if (set.sync === false) { await sync().remove(gone); return; }
       const tombs = readTombs(ss);
-      const now = Date.now();
       for (const id of ids) tombs.set(String(id), now);
       await writeTombs(ss, tombs, new Set(ids.map(String)), gone, ids);
     });
@@ -782,21 +814,102 @@ export async function restoreItems(list, richMap) {
       let hit = false;
       for (const id of ids) if (tombs.delete(id)) hit = true;
       if (hit) await writeTombs(ss, tombs, new Set());
+      const lt = readLocalTombs(await local().get(LOCAL_TOMBS_KEY));
+      let lhit = false;
+      for (const id of ids) if (id in lt) { delete lt[id]; lhit = true; }
+      if (lhit) await local().set({ [LOCAL_TOMBS_KEY]: lt });
     });
   } catch { /* 記録が残っても、保存し直した時刻の方が新しいので消えない */ }
   return putItems(list.map(i => ({ ...i })), richMap);
 }
 
 /**
+ * Google ドライブなど、外から届いた内容を取り込む。putItems と違って更新時刻（up）を付け直さない
+ * （付け直すと、どの PC の内容が新しいのかが分からなくなる）。
+ * 書く直前の端末の内容と突き合わせ、届いた方が新しいものだけを書く（同期の最中の編集を巻き戻さない）。
+ * 削除の記録は届いた時刻のまま端末に足し、Chrome の同期にも伝える（消したあとで「元に戻す」した分を、
+ * 古い削除で消し直さないよう、時刻を「今」にしない）。
+ * @param {{items?: object[], rich?: object, tombs?: object, wipe?: number}} inc
+ * @returns {Promise<{ok: boolean, put: number, dropped: number, error?: string}>}
+ */
+export async function applyRemote(inc) {
+  let put = 0, dropped = 0;
+  try {
+    await withTombLock(async () => {
+      const now = Date.now();
+      const [ls, ss] = await Promise.all([local().get(null), sync().get(null)]);
+      const set = mergeMeta(ss[META_KEY]).s;
+      const lt = readLocalTombs(ls, now);
+      let ltChanged = false;
+      for (const [id, t] of Object.entries((inc && inc.tombs) || {})) {
+        const n = Number(t);
+        if (n > 0 && now - n < DEL_KEEP_DAYS * DAY_MS && n > (lt[id] || 0)) { lt[id] = n; ltChanged = true; }
+      }
+      const oldWipe = Number(ss[WIPE_KEY]) || 0;
+      const wipe = Math.max(oldWipe, Number(inc && inc.wipe) || 0);
+      const tombAt = allTombs({ [LOCAL_TOMBS_KEY]: lt }, ss);
+
+      const cur = new Map();
+      for (const [k, v] of Object.entries(ls)) if (k.startsWith(LOCAL_PREFIX) && v && v.u) cur.set(String(v.id), v);
+      const richIn = (inc && inc.rich && typeof inc.rich === 'object') ? inc.rich : {};
+      const out = {};
+      for (const it of (inc && inc.items) || []) {
+        if (!it || it.id == null || !isSavableUrl(it.u)) continue;
+        const id = String(it.id);
+        const have = cur.get(id);
+        if (isDeleted(id, stampOf(it), tombAt, wipe)) continue;
+        if (have && stampOf(have) >= stampOf(it)) continue;      // 端末の方が新しい（か同じ）
+        out[LOCAL_PREFIX + it.id] = it;
+        cur.set(id, it);
+        put++;
+      }
+      // サムネイルなどは、端末に無いものだけ足す（時刻を持たないので上書きしない）
+      for (const [id, r] of Object.entries(richIn)) {
+        if (r && typeof r === 'object' && cur.has(id) && !ls[RICH_PREFIX + id]) out[RICH_PREFIX + id] = r;
+      }
+      const drop = [];
+      for (const [id, v] of cur) if (isDeleted(id, stampOf(v), tombAt, wipe)) drop.push(id);
+      for (const id of drop) { delete out[LOCAL_PREFIX + id]; delete out[RICH_PREFIX + id]; }
+      if (ltChanged) out[LOCAL_TOMBS_KEY] = lt;
+      if (Object.keys(out).length) await local().set(out);
+      if (drop.length) await local().remove(drop.flatMap(id => [LOCAL_PREFIX + id, RICH_PREFIX + id]));
+      dropped = drop.filter(id => ls[LOCAL_PREFIX + id]).length;
+
+      // Chrome の同期にも伝える（伝えないと、同期に残っている写しが取り込み直される）
+      if (wipe > oldWipe) await sync().set({ [WIPE_KEY]: wipe });
+      const gone = drop.map(id => ITEM_PREFIX + id).filter(k => k in ss);
+      const withTomb = drop.filter(id => tombAt.has(id));
+      if (set.sync !== false && withTomb.length) {
+        const tombs = readTombs(ss);
+        for (const id of withTomb) if (tombAt.get(id) > (tombs.get(id) || 0)) tombs.set(id, tombAt.get(id));
+        await writeTombs({ ...ss, ...(wipe > oldWipe ? { [WIPE_KEY]: wipe } : {}) }, tombs, new Set(withTomb), gone, withTomb);
+      } else if (gone.length) {
+        await sync().remove(gone);
+      }
+    });
+  } catch (e) {
+    return { ok: false, put, dropped, error: describeLocalError(e) };
+  }
+  await syncPush();
+  return { ok: true, put, dropped };
+}
+
+/**
  * すべて消す（設定ダイアログの「すべて削除」）。
- * 同期オン … ほかの PC の項目と設定も消す（「すべて削除した」時刻を同期に残す）
+ * 同期オン（または Google ドライブ同期中）… ほかの PC の項目と設定も消す（「すべて削除した」時刻を同期に残す）
  * 同期オフ … この端末の項目だけを消す。1件ずつの削除と同じく、ほかの PC には伝えない
  *            （設定は同期で共有しているので残す）
  * @returns {{ok: boolean, scope: 'all'|'local'}}
  */
 export async function wipeAll() {
-  let syncOn = true;
-  try { syncOn = (await getMeta()).s.sync !== false; } catch { /* 読めなければ従来どおり全部消す */ }
+  let syncOn = true, driveOn = false;
+  try {
+    const s = (await getMeta()).s;
+    driveOn = !!s.driveOn;
+    // Google ドライブでつないでいるときも「ほかの PC と共有している」ので、ほかの PC からも消す
+    //（この端末だけ消しても、次の同期でドライブから戻ってきてしまう）
+    syncOn = s.sync !== false || !!s.driveOn;
+  } catch { /* 読めなければ従来どおり全部消す */ }
   // 先に sync 側を片付ける。逆順だと、消している最中に別のコンテキスト（Service Worker）が
   // getAll() を呼び、sync に残っていた項目を local へ取り込み直してしまう。
   if (syncOn) {
@@ -814,6 +927,9 @@ export async function wipeAll() {
   // 「すべて削除した」ことを同期にも残す。これが無いと、他の PC に残っていた項目が
   // 次の同期でそっくり戻ってきてしまう（削除の記録は消してしまったので効かない）。
   if (syncOn) { try { await sync().set({ [WIPE_KEY]: Date.now() }); } catch { /* 続行 */ } }
+  // Google ドライブとのつながりは残す（消すと、ドライブとつないでいるほかの PC に「すべて削除」が届かず、
+  // 次につないだときに全部戻ってくる。ドライブの日ごとのバックアップは残るので、そこから戻せる）
+  if (syncOn && driveOn) await setMeta({ s: { driveOn: true } });
   return { ok: true, scope: syncOn ? 'all' : 'local' };
 }
 
@@ -872,7 +988,7 @@ export function sanitizeSettings(raw, cur, opts = {}) {
     const steps = raw.steps.map(Number).filter(n => Number.isFinite(n) && n > 0).map(n => Math.min(3650, Math.round(n))).slice(0, 12);
     if (steps.length) take('steps', steps);
   }
-  for (const k of ['notify', 'badge', 'sync', 'thumbs', 'embed', 'knOn']) {
+  for (const k of ['notify', 'badge', 'sync', 'thumbs', 'embed', 'knOn', 'driveOn']) {
     if (typeof raw[k] === 'boolean') take(k, raw[k]);
   }
   take('hour', num(raw.hour, 0, 23));

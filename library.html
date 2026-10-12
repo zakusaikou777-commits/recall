@@ -29,6 +29,8 @@
     <b>Recall へようこそ。</b>
     ツールバーの <img src="icons/icon16.png" alt="" class="inlineicon"> ボタン（<kbd>Alt</kbd>+<kbd>S</kbd>）で今見ているページを保存できます。
     保存したページは忘却曲線に沿って「今日の復習」に並びます。
+    <br><span class="faint">以前の Recall（v1.8 以前）から移すときは、古い方で書き出した JSON を ⚙ 設定 →「JSONを読み込み」で読み込んでください。
+    Google ドライブ同期を使っていたなら、⚙ 設定 →「Google ドライブにつなぐ」で戻ります。</span>
   </div>
   <button id="welcomeClose" class="btn sm ghost">閉じる</button>
 </div>
@@ -186,6 +188,30 @@
       <div class="field" style="max-width:220px">
         <label for="sSyncMax">同期する件数の上限</label>
         <input id="sSyncMax" type="number" min="0" max="500" step="1">
+      </div>
+    </section>
+
+    <section>
+      <h3>Google ドライブ同期</h3>
+      <p class="faint">
+        Chrome にログインしている Google アカウントのドライブ（アプリ専用の領域。ドライブの画面には出ません）に
+        <b>全件</b>を置いて、つないだ PC 同士で同期します。拡張機能のフォルダを消したり PC を入れ替えたりしても、
+        つなぎ直せば戻ります。1日1回、その日の状態を7日分残します。
+      </p>
+      <div class="drivebox">
+        <div id="gdStatus" class="drivestatus"></div>
+        <div class="row" style="flex-wrap:wrap">
+          <button type="button" id="gdConnect" class="btn primary">Google ドライブにつなぐ</button>
+          <button type="button" id="gdSync" class="btn">今すぐ同期</button>
+          <div class="grow"></div>
+          <button type="button" id="gdDisconnect" class="btn ghost">同期をやめる</button>
+        </div>
+        <div id="gdMsg" class="faint" style="font-size:11.5px"></div>
+        <details id="gdBackupBox" class="drivebackups">
+          <summary>ドライブのバックアップから戻す</summary>
+          <p class="faint" style="font-size:11.5px">選んだ日の状態から、いま無い項目だけを読み込みます（いまある項目は変えません）。</p>
+          <ul id="gdBackups" class="knqlist"></ul>
+        </details>
       </div>
     </section>
 

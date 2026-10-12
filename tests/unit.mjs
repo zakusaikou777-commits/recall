@@ -1083,5 +1083,263 @@ ok('再送のアラームを止める', !fakeBrowser.alarms.has(KN.RETRY_ALARM))
 await KN.removeFromQueue(wA.id);
 await resetAll();
 
+/* ---------- 1.9.0: Google ドライブ同期 ---------- */
+// ドライブの API と chrome.identity を、メモリの中だけで再現する
+const fakeDrive = {
+  files: new Map(), seq: 0, token: 'tok1', tokenSeq: 1,
+  downloads: 0, uploads: 0, calls: [], expireOnce: false, failWith: null, networkDown: false,
+  authError: null, removedTokens: [], violations: [],
+  reset() {
+    this.files.clear(); this.seq = 0; this.token = 'tok1'; this.tokenSeq = 1; this.downloads = 0; this.uploads = 0;
+    this.calls = []; this.expireOnce = false; this.failWith = null; this.networkDown = false; this.authError = null; this.removedTokens = [];
+  },
+  byName(n) { return [...this.files.values()].filter(f => f.name === n).sort((a, b) => a.created - b.created); },
+  backups() { return [...this.files.values()].filter(f => f.name.startsWith('recall-backup-')).map(f => f.name).sort(); },
+  add(name, content) { const id = 'f' + (++this.seq); this.files.set(id, { id, name, content, version: 1, created: this.seq }); return id; },
+  remote() { const f = this.byName('recall-sync.json')[0]; return f ? JSON.parse(f.content) : null; },
+  async fetch(url, init = {}) {
+    const u = new URL(url);
+    const method = (init.method || 'GET').toUpperCase();
+    const res = (status, body, text) => ({
+      ok: status >= 200 && status < 300, status,
+      json: async () => body, text: async () => (text !== undefined ? text : JSON.stringify(body))
+    });
+    if (u.hostname === 'accounts.google.com') return res(200, {});
+    this.calls.push(`${method} ${u.pathname}`);
+    if (this.networkDown) throw new TypeError('Failed to fetch');
+    if (this.failWith) return res(this.failWith.status, { error: this.failWith.error });
+    if (this.expireOnce) { this.expireOnce = false; return res(401, { error: { code: 401, message: 'Invalid Credentials' } }); }
+    if ((init.headers || {}).Authorization !== 'Bearer ' + this.token) return res(401, { error: { code: 401, message: 'Invalid Credentials' } });
+    if (u.pathname === '/drive/v3/files' && method === 'GET') {
+      if (u.searchParams.get('spaces') !== 'appDataFolder') this.violations.push('appDataFolder 以外を探した');
+      const q = u.searchParams.get('q') || '';
+      let files = [...this.files.values()];
+      const eqm = q.match(/name = '([^']+)'/), cm = q.match(/name contains '([^']+)'/);
+      if (eqm) files = files.filter(f => f.name === eqm[1]);
+      if (cm) files = files.filter(f => f.name.includes(cm[1]));
+      files.sort((a, b) => a.created - b.created);
+      return res(200, { files: files.map(f => ({ id: f.id, name: f.name, version: String(f.version), size: String(f.content.length) })) });
+    }
+    if (u.pathname === '/drive/v3/files' && method === 'POST') {
+      const meta = JSON.parse(init.body);
+      if (JSON.stringify(meta.parents) !== '["appDataFolder"]') this.violations.push('appDataFolder 以外に作った: ' + meta.name);
+      const id = this.add(meta.name, '');
+      return res(200, { id, version: '1' });
+    }
+    let m = u.pathname.match(/^\/drive\/v3\/files\/([^/]+)$/);
+    if (m && method === 'GET' && u.searchParams.get('alt') === 'media') {
+      const f = this.files.get(decodeURIComponent(m[1]));
+      if (!f) return res(404, { error: { code: 404, message: 'File not found' } });
+      this.downloads++;
+      return res(200, null, f.content);
+    }
+    if (m && method === 'DELETE') { this.files.delete(decodeURIComponent(m[1])); return res(204, null, ''); }
+    m = u.pathname.match(/^\/upload\/drive\/v3\/files\/([^/]+)$/);
+    if (m && method === 'PATCH') {
+      const f = this.files.get(decodeURIComponent(m[1]));
+      if (!f) return res(404, { error: { code: 404, message: 'File not found' } });
+      f.content = init.body; f.version++; this.uploads++;
+      return res(200, { id: f.id, version: String(f.version) });
+    }
+    return res(400, { error: { code: 400, message: 'unknown ' + method + ' ' + u.pathname } });
+  }
+};
+globalThis.fetch = (url, init) => fakeDrive.fetch(url, init);
+chrome.identity = {
+  getAuthToken: async () => { if (fakeDrive.authError) throw new Error(fakeDrive.authError); return { token: fakeDrive.token }; },
+  removeCachedAuthToken: async ({ token }) => {
+    fakeDrive.removedTokens.push(token);
+    if (token === fakeDrive.token) fakeDrive.token = 'tok' + (++fakeDrive.tokenSeq);
+  }
+};
+const READY_MANIFEST = { version: '1.9.0', oauth2: { client_id: '1234-abcd.apps.googleusercontent.com', scopes: ['https://www.googleapis.com/auth/drive.appdata'] } };
+chrome.runtime.getManifest = () => READY_MANIFEST;
+const DR = await import(pathToFileURL(path.join(ROOT, 'drive.js')).href);
+
+// もう1台（別の Chrome アカウントで、Chrome の同期を共有しない PC）
+const syncAreaC = makeArea({ perItem: 8192, total: 102400, maxItems: 512 });
+const localAreaC = makeArea({ perItem: Infinity, total: Infinity, maxItems: Infinity });
+async function onPcC(fn) {
+  const [l, sy] = [chrome.storage.local, chrome.storage.sync];
+  chrome.storage.local = localAreaC; chrome.storage.sync = syncAreaC;
+  try { return await fn(); } finally { chrome.storage.local = l; chrome.storage.sync = sy; }
+}
+
+console.log('\n--- Google ドライブ同期: 内容を合わせる（純粋な関数） ---');
+const D0 = Date.now();
+const dit = (id, up, extra = {}) => ({ ...S.makeItem({ id, u: `https://drive.example/${id}`, t: id, c: 'c0', ...extra }, meta), up });
+let mg = DR.mergeSync({ items: [dit('a', 100), dit('b', 200)], tombs: {}, wipe: 0 }, { items: [dit('a', 150), dit('b', 150), dit('c', 100)], tombs: {}, wipe: 0 }, D0);
+eq('同じ項目は更新の新しい方', mg.items.map(i => `${i.id}:${i.up}`).sort(), ['a:150', 'b:200', 'c:100']);
+eq('端末に書くのはドライブの方が新しい分だけ', mg.put.map(i => i.id).sort(), ['a', 'c']);
+mg = DR.mergeSync({ items: [dit('a', D0 - 1000)], tombs: {} }, { items: [], tombs: { a: D0 - 500 } }, D0);
+eq('ドライブの削除の記録で消える', mg.items.length, 0);
+mg = DR.mergeSync({ items: [dit('a', D0 - 100)], tombs: {} }, { items: [], tombs: { a: D0 - 500 } }, D0);
+eq('消したあとで戻した（更新が新しい）項目は残る', mg.items.map(i => i.id), ['a']);
+mg = DR.mergeSync({ items: [dit('a', D0 - 2000), dit('b', D0)], tombs: {} }, { items: [], tombs: {}, wipe: D0 - 1000 }, D0);
+eq('「すべて削除」より前の内容は消える', mg.items.map(i => i.id), ['b']);
+mg = DR.mergeSync({ items: [], tombs: { old: D0 - 61 * 86400000, keep: D0 - 1000 } }, null, D0);
+eq('60日を過ぎた削除の記録は捨てる', Object.keys(mg.tombs), ['keep']);
+mg = DR.mergeSync({ items: [dit('a', 1), dit('b', 1)], rich: { a: { si: '端末' } } }, { items: [], rich: { a: { si: 'ドライブ' }, b: { si: 'ドライブ' } } }, D0);
+eq('サムネイル情報は端末を優先し、無い分だけドライブから', mg.rich, { a: { si: '端末' }, b: { si: 'ドライブ' } });
+const snapA = DR.buildSnapshot({ items: [dit('b', 2), dit('a', 1)], rich: {}, tombs: { z: 5, y: 4 }, wipe: 0, meta }, 111);
+const snapB = DR.buildSnapshot({ items: [dit('a', 1), dit('b', 2)], rich: {}, tombs: { y: 4, z: 5 }, wipe: 0, meta: { ...meta, s: { ...meta.s, hour: 3 } } }, 222);
+eq('並び順・保存時刻・設定が違っても、中身が同じなら指紋は同じ', DR.fingerprint(snapA), DR.fingerprint(snapB));
+ok('項目の更新時刻が変われば指紋も変わる', DR.fingerprint(snapA) !== DR.fingerprint(DR.buildSnapshot({ items: [dit('a', 1), dit('b', 3)], rich: {}, tombs: { y: 4, z: 5 }, wipe: 0, meta }, 1)));
+ok('ドメインの記憶（閲覧したサイト）はドライブに載せない', !('dom' in snapA.meta));
+eq('Recall のファイルでなければ読まない', [DR.parseSnapshot(null), DR.parseSnapshot({ items: [] }), DR.parseSnapshot({ app: 'x', items: [] })], [null, null, null]);
+const parsed = DR.parseSnapshot({
+  app: 'recall', items: [dit('ok1', 5), { ...dit('js', 5), u: 'javascript:alert(1)' }, dit('ok1', 9), { u: 'https://noid.example/' }],
+  rich: { ok1: { th: 'javascript:x', si: 'サイト', bad: 1 }, js: { si: 'x' } },
+  tombs: { t1: 10, t2: 'x' }, wipe: 3,
+  meta: { cats: [{ id: 'cA', name: 'A', color: '#123456' }, { id: 'bad id"', name: 'x' }, { id: 'cB', name: 'B', color: 'red' }], s: { hour: 7 } }
+});
+eq('http(s) の項目だけ・ID の重複は先のものだけ読む', parsed.items.map(i => `${i.id}:${i.up}`), ['ok1:5']);
+eq('サムネイル情報も確かめて読む', parsed.rich, { ok1: { si: 'サイト' } });
+eq('削除の記録は数値だけ', parsed.tombs, { t1: 10 });
+eq('カテゴリは不正な id を捨て、色を確かめる', parsed.meta.cats, [{ id: 'cA', name: 'A', color: '#123456' }, { id: 'cB', name: 'B', color: '#94a3b8' }]);
+eq('項目が指しているのに無いカテゴリを拾う', DR.missingCats([{ c: 'c0' }, { c: 'cA' }, { c: 'cA' }, { c: 'gone' }], meta.cats, parsed.meta.cats).map(c => c.id), ['cA']);
+eq('バックアップの名前は日付', DR.backupName(new Date(2026, 0, 5, 23).getTime()), 'recall-backup-2026-01-05.json');
+eq('エラーの種類', ['The user did not approve access.', 'The user is not signed in.', "OAuth2 request failed: Service responded with error: 'bad client id: x'", 'OAuth2 not granted or revoked.', 'Failed to fetch', 'なにか'].map(m => DR.classifyError(new Error(m)).code),
+  ['denied', 'signin', 'clientid', 'auth', 'offline', 'failed']);
+
+console.log('\n--- Google ドライブ同期: 2台の PC ---');
+await resetAll({ ...structuredClone(meta), s: { ...meta.s, sync: false, driveOn: true } });
+fakeDrive.reset();
+const dg1 = S.makeItem({ u: 'https://drive.example/1', t: 'A の項目1', c: 'c1' }, meta);
+const dg2 = S.makeItem({ u: 'https://drive.example/2', t: 'A の項目2', c: 'c2' }, meta);
+await S.putItems([dg1, dg2], { [dg1.id]: { si: 'サイトA' } });
+let gr = await DR.syncDrive();
+ok('PC A: 同期できる', gr.ok && gr.uploaded);
+eq('ドライブに同期用のファイルが1つ', fakeDrive.byName(DR.DRIVE_FILE).length, 1);
+eq('ドライブに2件', fakeDrive.remote().items.length, 2);
+ok('サムネイル情報も載る', fakeDrive.remote().rich[dg1.id].si === 'サイトA');
+eq('その日のバックアップが1つできる', fakeDrive.backups().length, 1);
+eq('Chrome の同期はオフのまま（ドライブだけで運ぶ）', Object.keys(syncArea._mem).filter(k => k.startsWith('i:')).length, 0);
+gr = await onPcB(() => DR.syncDrive());
+const onB1 = (await onPcB(() => S.getAll()));
+eq('PC B に2件届く', onB1.items.map(i => i.id).sort(), [dg1.id, dg2.id].sort());
+eq('更新時刻は付け直さない', onB1.items.find(i => i.id === dg1.id).up, (await S.getAll()).items.find(i => i.id === dg1.id).up);
+eq('サムネイル情報も届く', onB1.rich[dg1.id], { si: 'サイトA' });
+eq('PC B の取り込み件数', gr.put, 2);
+const dlBefore = fakeDrive.downloads, upBefore = fakeDrive.uploads;
+gr = await DR.syncDrive();
+ok('変わっていなければダウンロードもアップロードもしない', gr.ok && gr.skipped && fakeDrive.downloads === dlBefore && fakeDrive.uploads === upBefore);
+
+await new Promise(r => setTimeout(r, 5));
+await onPcB(async () => {
+  const cur = (await S.getAll()).items.find(i => i.id === dg1.id);
+  await S.putItems([{ ...cur, n: 'B で書いたメモ' }]);
+  await DR.syncDrive();
+});
+await DR.syncDrive();
+eq('B での編集が A に届く', (await S.getAll()).items.find(i => i.id === dg1.id).n, 'B で書いたメモ');
+
+const dg2full = { ...(await S.getAll()).items.find(i => i.id === dg2.id) };
+await new Promise(r => setTimeout(r, 5));
+await S.removeItems([dg2.id]);
+const tombG2 = (localArea._mem[S.LOCAL_TOMBS_KEY] || {})[dg2.id];
+ok('A に削除の記録が残る（Chrome の同期がオフでも）', tombG2 > 0);
+await DR.syncDrive();
+eq('ドライブにも削除の記録が載る', fakeDrive.remote().tombs[dg2.id], tombG2);
+await onPcB(() => DR.syncDrive());
+ok('A で消すと B でも消える', !(await onPcB(() => S.getAll())).items.some(i => i.id === dg2.id));
+eq('B の削除の記録は A と同じ時刻（「今」にしない）', (localAreaB._mem[S.LOCAL_TOMBS_KEY] || {})[dg2.id], tombG2);
+await new Promise(r => setTimeout(r, 5));
+await S.restoreItems([dg2full]);
+ok('元に戻すと A の削除の記録から外れる', !((localArea._mem[S.LOCAL_TOMBS_KEY] || {})[dg2.id]));
+await DR.syncDrive();
+await onPcB(() => DR.syncDrive());
+ok('元に戻すと B にも戻る', (await onPcB(() => S.getAll())).items.some(i => i.id === dg2.id));
+
+console.log('\n--- Google ドライブ同期: 2台が同時に書いたとき ---');
+const mainFile = fakeDrive.byName(DR.DRIVE_FILE)[0];
+const stale = JSON.parse(mainFile.content);
+stale.items = stale.items.filter(i => i.id !== dg1.id);           // ほかの PC が古い内容で上書きした
+mainFile.content = JSON.stringify(stale); mainFile.version++;
+await DR.syncDrive();
+ok('上書きで消えた分も、持っている PC の次の同期で戻る', fakeDrive.remote().items.some(i => i.id === dg1.id));
+ok('上書きされても A の項目は消えない', (await S.getAll()).items.some(i => i.id === dg1.id));
+fakeDrive.add(DR.DRIVE_FILE, JSON.stringify(DR.buildSnapshot({ items: [dit('twin1', Date.now())], rich: {}, tombs: {}, wipe: 0, meta }, Date.now())));
+await DR.syncDrive();
+eq('同じ名前のファイルが2つできても1つにまとめる', fakeDrive.byName(DR.DRIVE_FILE).length, 1);
+ok('もう一方の中身も取り込む', (await S.getAll()).items.some(i => i.id === 'twin1') && fakeDrive.remote().items.some(i => i.id === 'twin1'));
+
+console.log('\n--- Google ドライブ同期: 認証とエラー ---');
+fakeDrive.expireOnce = true;
+gr = await DR.syncDrive({ force: true });
+ok('トークンが切れていたら1回だけ取り直して続ける', gr.ok && fakeDrive.removedTokens.includes('tok1'));
+fakeDrive.failWith = { status: 403, error: { code: 403, message: 'Google Drive API has not been used in project 1 before or it is disabled.', errors: [{ reason: 'accessNotConfigured' }] } };
+gr = await DR.syncDrive({ force: true });
+eq('Drive API が無効なら知らせる', gr.reason, 'api');
+eq('結果を控える（設定画面に出す）', (await DR.getDriveState()).err, 'api');
+fakeDrive.failWith = { status: 503, error: { code: 503, message: 'backendError' } };
+eq('混み合っているとき', (await DR.syncDrive({ force: true })).reason, 'busy');
+fakeDrive.failWith = null;
+fakeDrive.networkDown = true;
+eq('ネットにつながらないとき', (await DR.syncDrive({ force: true })).reason, 'offline');
+fakeDrive.networkDown = false;
+gr = await DR.syncDrive({ force: true });
+ok('つながったら戻る', gr.ok && (await DR.getDriveState()).err === '');
+chrome.runtime.getManifest = () => ({ version: '1.9.0', oauth2: { client_id: 'YOUR_CLIENT_ID.apps.googleusercontent.com' } });
+const callsBefore = fakeDrive.calls.length;
+gr = await DR.syncDrive({ force: true });
+ok('client_id が未設定なら通信しない', gr.reason === 'noclient' && fakeDrive.calls.length === callsBefore);
+eq('つなぐボタンも同じ理由で止まる', (await DR.connectDrive()).reason, 'noclient');
+chrome.runtime.getManifest = () => READY_MANIFEST;
+fakeDrive.authError = 'The user did not approve access.';
+eq('許可の画面で断られたとき', (await DR.connectDrive()).reason, 'denied');
+fakeDrive.authError = null;
+await S.setMeta({ s: { driveOn: false } });
+eq('オフなら何もしない', (await DR.syncDrive()).reason, 'off');
+gr = await DR.connectDrive();
+ok('つなぐとオンになり、すぐに同期する', gr.ok && (await S.getMeta()).s.driveOn === true);
+
+console.log('\n--- Google ドライブ同期: 入れ直した PC で戻す ---');
+await S.setMeta({ cats: [...(await S.getMeta()).cats, { id: 'cDrive', name: 'ドライブ用', color: '#123456' }], s: { hour: 21 } });
+await S.putItems([S.makeItem({ u: 'https://drive.example/cat', t: 'カテゴリつき', c: 'cDrive' }, meta)]);
+await DR.syncDrive();
+const totalA = (await S.getAll()).items.length;
+await onPcC(async () => {
+  await S.replaceMeta({ ...structuredClone(S.DEFAULT_META), s: { ...S.DEFAULT_META.s, driveOn: true } });
+  const r = await DR.syncDrive();
+  const c = await S.getAll();
+  eq('入れ直した PC に全件が戻る', [r.ok, c.items.length], [true, totalA]);
+  ok('カテゴリも戻る', c.meta.cats.some(x => x.id === 'cDrive' && x.name === 'ドライブ用'));
+  eq('設定も戻る', c.meta.s.hour, 21);
+  ok('ドライブ同期はオンのまま', c.meta.s.driveOn === true);
+});
+
+console.log('\n--- Google ドライブ同期: 日ごとのバックアップ ---');
+for (let k = 1; k <= 9; k++) await DR.syncDrive({ force: true, now: Date.now() + k * 86400000 });
+eq('バックアップは7日分だけ残す', fakeDrive.backups().length, DR.BACKUP_KEEP);
+eq('残るのは新しい日', fakeDrive.backups()[DR.BACKUP_KEEP - 1], DR.backupName(Date.now() + 9 * 86400000));
+const lb = await DR.listBackups();
+ok('一覧は新しい順', lb.ok && lb.backups[0].name === DR.backupName(Date.now() + 9 * 86400000) && lb.backups.length === DR.BACKUP_KEEP);
+const gb = await DR.getBackup(lb.backups[0].id);
+eq('バックアップを読み込みと同じ形で返す', [gb.ok, gb.data.items.length, Array.isArray(gb.data.meta.cats)], [true, totalA, true]);
+
+console.log('\n--- Google ドライブ同期: すべて削除 ---');
+const backupsBefore = fakeDrive.backups().length;
+eq('ドライブ同期中の「すべて削除」はほかの PC とも共有する', (await S.wipeAll()).scope, 'all');
+ok('ドライブとのつながりは残す', (await S.getMeta()).s.driveOn === true);
+await DR.syncDrive();
+eq('ドライブからも消える', fakeDrive.remote().items.length, 0);
+await onPcC(() => DR.syncDrive());
+eq('Chrome の同期を共有しない PC でも、ドライブ経由で消える', (await onPcC(() => S.getAll())).items.length, 0);
+eq('日ごとのバックアップは残る（空では上書きしない）', fakeDrive.backups().length, backupsBefore);
+ok('「すべて削除」したあとは、ドライブからカテゴリや設定を戻さない', !(await S.getMeta()).cats.some(c => c.id === 'cDrive') && (await S.getMeta()).s.hour !== 21);
+const restore = await DR.getBackup((await DR.listBackups()).backups[0].id);
+ok('バックアップから戻せる中身がある', restore.ok && restore.data.items.length === totalA);
+
+eq('ドライブのアプリ専用の領域だけを使う（ほかのファイルには触れない）', fakeDrive.violations, []);
+
+console.log('\n--- Google ドライブ同期: やめる ---');
+await DR.disconnectDrive();
+ok('オフになる', (await S.getMeta()).s.driveOn === false);
+ok('許可（トークン）を手放す', fakeDrive.removedTokens.length >= 2);
+eq('控えも消す', await DR.getDriveState(), {});
+await S.removeItems([]);
+await resetAll();
+
 console.log(`\n${pass} 件成功 / ${fail} 件失敗`);
 process.exit(fail ? 1 : 0);
