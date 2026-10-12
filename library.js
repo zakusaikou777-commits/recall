@@ -10,7 +10,10 @@ import {
   newId, LIMITS
 } from './store.js';
 import { CHANGELOG, currentVersion, entryFor } from './changelog.js';
-import { KN_CATEGORIES, originOf, clipEnabled, MAX_TRIES, getQueue, takeSentWhileGone } from './kininari.js';
+import {
+  KN_CATEGORIES, originOf, clipEnabled, MAX_TRIES, getQueue, takeSentWhileGone,
+  readKininariFolders, mergeFolderCats, CAT_NAME_MAX
+} from './kininari.js';
 
 const $ = (id) => document.getElementById(id);
 let items = [], meta = null, rich = {};
@@ -787,6 +790,7 @@ function openSettingsForm() {
   renderKnQueue();
   renderDrive();
   $('gdMsg').textContent = '';
+  $('catFromKnMsg').textContent = '';
   $('gdBackupBox').open = false;
   $('sThumbs').checked = meta.s.thumbs !== false;
   $('sEmbed').checked = meta.s.embed !== false;
@@ -1328,6 +1332,35 @@ function bind() {
     });
   });
   $('gdBackupBox').addEventListener('toggle', () => { if ($('gdBackupBox').open) renderDriveBackups(); });
+
+  // 気になり帳のフォルダを、Recall のカテゴリに取り込む（足すだけ。消したり名前を変えたりはしない）
+  $('catFromKn').addEventListener('click', async () => {
+    const btn = $('catFromKn'), out = $('catFromKnMsg');
+    if (btn.disabled) return;
+    // 設定は閉じたときに保存されるので、入力中の URL を優先する
+    const knUrl = clip($('sKnUrl').value, 300).trim() || meta.s.knUrl;
+    btn.disabled = true;
+    out.textContent = '気になり帳のフォルダを読んでいます…';
+    try {
+      const res = await readKininariFolders(knUrl);
+      if (!res.ok) { out.textContent = res.message; return; }
+      if (!res.folders.length) { out.textContent = '気になり帳にフォルダがありません。'; return; }
+      const r = mergeFolderCats(meta.cats, res.folders, () => 'c' + newId());
+      if (r.added.length) {
+        meta.cats = r.cats;
+        if (!(await saveMeta())) { out.textContent = 'カテゴリを保存できませんでした。'; return; }
+        renderCatEditor();
+        fillCatSelect($('sCat'), $('sCat').value);
+        render();
+      }
+      const long = r.tooLong.length
+        ? `名前が長い ${r.tooLong.length} 件（${r.tooLong.map(n => clip(n, 16)).join('・')}）は取り込めませんでした（カテゴリ名は${CAT_NAME_MAX}文字まで）。`
+        : '';
+      out.textContent = (r.added.length
+        ? `${r.added.length} 件のフォルダをカテゴリに足しました（${r.added.join('・')}）。` + (r.same ? `すでにある ${r.same} 件はそのままです。` : '')
+        : '気になり帳のフォルダは、すべて Recall のカテゴリにあります。') + long;
+    } finally { btn.disabled = false; }
+  });
 
   $('expJson').onclick = exportJson;
   $('expCsv').onclick = exportCsv;

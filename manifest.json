@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Recall — 復習ブックマーク",
   "short_name": "Recall",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "ワンクリックでページを保存。カテゴリ・タグで整理して、忘却曲線に沿ったタイミングで復習を通知します。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2+7WZBTHRBO24rCSiUu93hHtiNAZfOxCe7bUMhIcIruOv2+ArHx/+qDpBOEKleA5f+mAb5DuE2OZ7vaqGXpL0RC3VMbiDp1MPhiwJOGuxA6VN8amS+mzNLU8C+Td+GAyOfZhgCiS0dE+zeecSKoPQrpT0rBpJ7076mjH5DwAbQN9RDYk2zAaOQ9aWtUQFcGZmtafSD5tB8hgsxKwYTdA90cq2JkvfElWLBX3x7+Zk6QbD9hNBRMsqF6a1C5iidGuRt9PwpPoVzyV+6MTvGUNOXXOQZr92Qe1uNBQb3jyMC8+q18CedNmo2rKOL/S3/RjdRHiiwuEGAXupxkjp5EztwIDAQAB",
   "permissions": [

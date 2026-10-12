@@ -1,6 +1,6 @@
 {
   "name": "recall-extension",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "private": true,
   "type": "module",
   "description": "Recall — 復習ブックマーク（Chrome 拡張機能）のテスト環境",

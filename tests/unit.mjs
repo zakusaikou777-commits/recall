@@ -67,7 +67,13 @@ const fakeBrowser = {
   onCreate: null,            // タブを開いた瞬間に割り込む処理（送信中の削除など）
   alarms: new Map(),
   reply: undefined,          // 気になり帳の返事（{saved, status}）。未設定なら savedFlag（古い版の気になり帳）
-  reset() { this.createFails = false; this.hasPermission = true; this.savedFlag = true; this.reply = undefined; this.tabs.clear(); this.created = []; this.attempts = 0; this.onCreate = null; }
+  tabStatus: undefined,      // tabs.get が返す読み込み状態（'complete' など）
+  queryTabs: null,           // tabs.query が返すタブ（開いているタブ）
+  removed: [],               // 閉じたタブ
+  reset() {
+    this.createFails = false; this.hasPermission = true; this.savedFlag = true; this.reply = undefined; this.tabs.clear();
+    this.created = []; this.attempts = 0; this.onCreate = null; this.tabStatus = undefined; this.queryTabs = null; this.removed = [];
+  }
 };
 const sessionMem = {};
 globalThis.chrome = {
@@ -102,9 +108,9 @@ globalThis.chrome = {
       fakeBrowser.created.push(url);
       return { id, url };
     },
-    get: async (id) => { if (!fakeBrowser.tabs.has(id)) throw new Error('no tab'); return { id }; },
-    remove: (id, cb) => { fakeBrowser.tabs.delete(id); if (cb) cb(); },
-    query: async () => []
+    get: async (id) => { if (!fakeBrowser.tabs.has(id)) throw new Error('no tab'); return fakeBrowser.tabStatus ? { id, status: fakeBrowser.tabStatus } : { id }; },
+    remove: (id, cb) => { fakeBrowser.tabs.delete(id); fakeBrowser.removed.push(id); if (cb) cb(); },
+    query: async () => fakeBrowser.queryTabs || []
   },
   alarms: {
     get: async (n) => fakeBrowser.alarms.get(n) || null,
@@ -238,8 +244,14 @@ ok('不一致', !S.matches(sample, 'vue'));
 console.log('\n--- バージョンと更新履歴 ---');
 const manifest = JSON.parse(await (await import('node:fs/promises')).readFile(path.join(ROOT, 'manifest.json'), 'utf8'));
 eq('manifest のバージョンと履歴の先頭が一致する', CL.CHANGELOG[0].v, manifest.version);
-ok('履歴が新しい順に並んでいる', CL.CHANGELOG.every((r, i) =>
-  i === 0 || CL.CHANGELOG[i - 1].v.split('.').map(Number).join('') > r.v.split('.').map(Number).join('')));
+// 数字ごとに比べる（つなげた文字列で比べると 1.10.0 が 1.9.0 より古いことになる）
+const verCmp = (a, b) => {
+  const x = a.split('.').map(Number), y = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+  return 0;
+};
+ok('履歴が新しい順に並んでいる', CL.CHANGELOG.every((r, i) => i === 0 || verCmp(CL.CHANGELOG[i - 1].v, r.v) > 0));
+ok('（確認）2桁の版も正しく比べる', verCmp('1.10.0', '1.9.0') > 0 && verCmp('1.9.0', '1.10.0') < 0);
 ok('すべての版に日付がある', CL.CHANGELOG.every(r => /^\d{4}-\d{2}-\d{2}$/.test(r.date)));
 ok('すべての版に中身がある', CL.CHANGELOG.every(r => (r.added || r.changed || r.fixed || []).length > 0));
 ok('バージョンが重複していない', new Set(CL.CHANGELOG.map(r => r.v)).size === CL.CHANGELOG.length);
@@ -1428,6 +1440,50 @@ eq('前の番号を使って並べ直せる（未確認の送り直し・元に�
 await KN.removeFromQueue(pItem.id);
 fakeBrowser.reset();
 await resetAll();
+
+/* ---------- 1.9.0: 気になり帳のフォルダを取り込む ---------- */
+console.log('\n--- 気になり帳のフォルダを取り込む ---');
+const knData = { memos: [], notebooks: [
+  { id: 'n1', name: '未分類', color: '#C0463C' }, { id: 'n2', name: 'オレンジカード', color: '#3E6CA3' },
+  { id: 'n3', name: 'ゲーム攻略', color: 'red' }, { id: 'n4', name: '攻略メモ', parentId: 'n3', color: '#57845A' },
+  { id: 'n5', name: ' 学習 ', color: '#C98A1B' }, { id: 'n6', name: 'オレンジカード', parentId: 'n3' }, { id: 'n7', name: '' },
+  { id: 'n8', name: 'とても長い名前のフォルダでカテゴリ名の上限を超えている' }
+] };
+const kf = KN.foldersFromKininariData(JSON.stringify(knData));
+eq('フォルダの名前を読む（入れ子も平らに・同じ名前は1つ・空は除く）', kf.map(f => f.name), ['未分類', 'オレンジカード', 'ゲーム攻略', '攻略メモ', '学習', 'とても長い名前のフォルダでカテゴリ名の上限を超えている']);
+eq('色は16進のものだけ使う', kf.map(f => f.color).slice(0, 3), ['#C0463C', '#3E6CA3', '']);
+eq('気になり帳のデータでなければ null', [KN.foldersFromKininariData('x{'), KN.foldersFromKininariData({ memos: [] }), KN.foldersFromKininariData(null)], [null, null, null]);
+let fid = 0;
+const kmerged = KN.mergeFolderCats(meta.cats, kf, () => 'cK' + (++fid));
+eq('Recall に無いフォルダだけ足す', kmerged.added, ['オレンジカード', 'ゲーム攻略', '攻略メモ']);
+eq('同じ名前のものはそのまま（未分類・学習）', kmerged.same, 2);
+eq('長すぎる名前は取り込まない（切り詰めると気になり帳に別のフォルダができる）', kmerged.tooLong.length, 1);
+eq('もとのカテゴリは消さない・並びも変えない', kmerged.cats.slice(0, meta.cats.length), meta.cats);
+eq('足したカテゴリは気になり帳の色', kmerged.cats.find(c => c.name === 'オレンジカード').color, '#3E6CA3');
+ok('色の無いものは Recall の色', /^#[0-9a-f]{6}$/i.test(kmerged.cats.find(c => c.name === 'ゲーム攻略').color));
+eq('大文字小文字の違いは同じ名前とみなす（気になり帳の照合と同じ）', KN.mergeFolderCats([{ id: 'x', name: 'Game' }], [{ name: 'game', color: '' }], () => 'y').added, []);
+eq('2回押しても増えない', KN.mergeFolderCats(kmerged.cats, kf, () => 'z').added, []);
+
+fakeBrowser.reset();
+eq('URL が無ければ読まない', (await KN.readKininariFolders('')).reason, 'nourl');
+fakeBrowser.hasPermission = false;
+eq('許可が無ければ「保存の確認を許可する」を求める', (await KN.readKininariFolders('https://kn.example/app/')).reason, 'perm');
+fakeBrowser.hasPermission = true;
+scriptingResult = JSON.stringify(knData);
+fakeBrowser.queryTabs = [{ id: 501, status: 'complete', url: 'https://kn.example/app/' }];
+let rf = await KN.readKininariFolders('https://kn.example/app/#knadd=x');
+ok('同じサイトのタブが開いていれば、それから読む（新しいタブは開かない）', rf.ok && rf.folders.length === kf.length && fakeBrowser.attempts === 0);
+fakeBrowser.queryTabs = [];
+fakeBrowser.tabStatus = 'complete';
+rf = await KN.readKininariFolders('https://kn.example/app/');
+ok('開いていなければ裏で開いて読む', rf.ok && fakeBrowser.attempts === 1 && fakeBrowser.created[0] === 'https://kn.example/app/');
+ok('読み終えたら閉じる', fakeBrowser.removed.length === 1 && fakeBrowser.tabs.size === 0);
+scriptingResult = null;
+rf = await KN.readKininariFolders('https://kn.example/app/');
+eq('気になり帳のデータが無いとき', rf.reason, 'nodata');
+ok('そのときもタブは閉じる', fakeBrowser.tabs.size === 0);
+scriptingResult = {};
+fakeBrowser.reset();
 
 console.log(`\n${pass} 件成功 / ${fail} 件失敗`);
 process.exit(fail ? 1 : 0);
