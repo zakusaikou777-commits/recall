@@ -1231,16 +1231,28 @@ eq2('拡張機能の ID が固定されている（フォルダの場所によ�
 await freshStore();
 await seedItems(2, { prefix: 'gd', title: 'ドライブ' });
 await openLib('all');
+const manifestOnDisk = JSON.parse(fs.readFileSync(path.join(EXT, 'manifest.json'), 'utf8'));
+const realCid = manifestOnDisk.oauth2 && manifestOnDisk.oauth2.client_id;
+ok('manifest に OAuth クライアント ID が入っている', /^[\w.-]+\.apps\.googleusercontent\.com$/.test(realCid || '') && !/YOUR_CLIENT_ID/.test(realCid));
+await lib.click('#btnSettings'); await lib.waitForTimeout(800);
+ok('つなぐ前は「つないでいません」と出る', (await lib.locator('#gdStatus').innerText()).includes('つないでいません'));
+ok('「つなぐ」を押せる', !(await lib.locator('#gdConnect').isDisabled()));
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
+await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'driveStatus' }));
+sw = ctx.serviceWorkers().filter(w => w.url().includes(id)).pop() || await ctx.waitForEvent('serviceworker', { timeout: 10000 });
+// client_id が未設定の版（フォークした人など）では「準備がまだ」と出て、押せない
+await sw.evaluate(() => {
+  self.__realGetManifest = chrome.runtime.getManifest;
+  const real = chrome.runtime.getManifest();
+  chrome.runtime.getManifest = () => ({ ...real, oauth2: { ...real.oauth2, client_id: 'YOUR_CLIENT_ID.apps.googleusercontent.com' } });
+});
 await lib.click('#btnSettings'); await lib.waitForTimeout(800);
 ok('client_id が未設定なら「準備がまだ」と出る', (await lib.locator('#gdStatus').innerText()).includes('準備がまだ'));
 ok('そのときは「つなぐ」を押せない', await lib.locator('#gdConnect').isDisabled());
 await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
 // Service Worker に、Google の許可とドライブの代わりを差し込む（本物の Google には送らない）
-await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'driveStatus' }));
-sw = ctx.serviceWorkers().filter(w => w.url().includes(id)).pop() || await ctx.waitForEvent('serviceworker', { timeout: 10000 });
 await sw.evaluate(() => {
-  const real = chrome.runtime.getManifest();
-  chrome.runtime.getManifest = () => ({ ...real, oauth2: { ...real.oauth2, client_id: '1234-e2e.apps.googleusercontent.com' } });
+  chrome.runtime.getManifest = self.__realGetManifest;
   chrome.identity.getAuthToken = async () => ({ token: 'e2e-token' });
   chrome.identity.removeCachedAuthToken = async () => {};
   const fd = self.__fakeDrive = {

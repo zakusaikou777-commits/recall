@@ -185,6 +185,7 @@ Google に「この拡張機能がドライブを使ってよい」と登録す�
    - アイテム ID：`kcgmjcokekapobnjijclhlhnaccdpkpp`（`chrome://extensions` の Recall の ID と同じか確かめてください）
 7. できた **クライアント ID**（`xxxx.apps.googleusercontent.com`）を `manifest.json` の
    `oauth2.client_id` に書き、`chrome://extensions` で Recall を再読み込みする
+   （このリポジトリの `manifest.json` には設定済みです。別の Google Cloud プロジェクトを使うときだけ書き換えてください）
 8. ライブラリ → ⚙ 設定 →「Google ドライブ同期」→「**Google ドライブにつなぐ**」
 
 2台目以降の PC では、Chrome の同期で「つなぐ」設定も届くので、Recall を入れるだけで自動でつながります
