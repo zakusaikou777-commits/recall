@@ -421,6 +421,29 @@ async function runSync({ interactive = false, force = false, now: nowOpt } = {})
   }
 }
 
+/** 同期が止まったことを知らせる間隔（同じ理由で止まっている間は1日1回まで） */
+export const DRIVE_ALERT_EVERY = 24 * 3600 * 1000;
+
+/**
+ * 裏で同期して失敗したとき、通知を出すか（純粋な関数）。
+ * 待っても直らない失敗（許可切れ・ログアウト・Google Cloud の設定）だけを知らせる。
+ * オフライン・混雑は自動で直るので知らせない。テスト中のアプリは許可が7日で切れることがあり、
+ * 設定画面を開かないと、同期が止まったことに気づけないため。
+ * @returns {{title: string, message: string}|null}
+ */
+export function driveAlertFor(result, lastAlertAt, now = Date.now()) {
+  if (!result || result.ok) return null;
+  const why = {
+    auth: 'Google の許可が切れました。ここを押して「つなぎ直す」を押してください。',
+    signin: 'Chrome に Google アカウントでログインしてから、つなぎ直してください。',
+    clientid: 'Google Cloud のクライアントの設定を確かめてください（ここを押すと理由を見られます）。',
+    api: 'Google Cloud で Google Drive API が有効になっていません（ここを押すと理由を見られます）。'
+  }[result.reason];
+  if (!why) return null;
+  if (lastAlertAt && now - lastAlertAt < DRIVE_ALERT_EVERY) return null;
+  return { title: 'Google ドライブとの同期が止まっています', message: why };
+}
+
 /** 「Google ドライブにつなぐ」: 許可を求め、オンにして、すぐに同期する */
 export async function connectDrive() {
   if (!clientIdReady()) return { ok: false, reason: 'noclient', message: DRIVE_MESSAGE.noclient };

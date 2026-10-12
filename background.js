@@ -16,7 +16,7 @@ import {
   clipEnabled, clipStateOf, CLIP_ALARM, RETRY_ALARM, CLIP_MESSAGE
 } from './kininari.js';
 import {
-  syncDrive, connectDrive, disconnectDrive, driveStatus, listBackups, getBackup, DRIVE_ALARM
+  syncDrive, connectDrive, disconnectDrive, driveStatus, listBackups, getBackup, driveAlertFor, DRIVE_ALARM
 } from './drive.js';
 
 const TICK = 'recall-tick';
@@ -70,7 +70,7 @@ async function runSetup() {
     // 起動時の設定を控えておく（次に変わったときだけ再送のきっかけにする）
     try { await writeClipCfg(clipCfgOf((await getAll()).meta)); } catch { /* 続行 */ }
     await flushClips();              // 前回送れなかった分を送り直す
-    await syncDrive();               // Google ドライブの最新を取り込む（オフなら何もしない）
+    await syncDriveInBackground();   // Google ドライブの最新を取り込む（オフなら何もしない）
     try { await chrome.storage.session.set({ [SETUP_KEY]: true }); } catch { /* 次に起きたときにやり直すだけ */ }
   } catch (e) {
     console.warn('[Recall] setup error', e);
@@ -99,8 +99,8 @@ function buildMenus() {
 /* ---------- 期限チェック ---------- */
 
 chrome.alarms.onAlarm.addListener(async (a) => {
-  if (a.name === TICK) { await refresh(); await syncDrive(); }   // ドライブ同期も30分ごとに確かめる
-  if (a.name === DRIVE_ALARM) await syncDrive();                 // 変更のあと少し待ってから送る
+  if (a.name === TICK) { await refresh(); await syncDriveInBackground(); }   // ドライブ同期も30分ごとに確かめる
+  if (a.name === DRIVE_ALARM) await syncDriveInBackground();                 // 変更のあと少し待ってから送る
   if (a.name === CLIP_ALARM) await sweepClips();
   if (a.name === RETRY_ALARM) await flushClips({ retry: true });   // 送れなかった分の再送（5分ごと）
 });
@@ -260,10 +260,47 @@ function openLibrary(hash = '') {
 
 chrome.notifications.onClicked.addListener((id) => {
   if (id === NOTIF_ID) { openLibrary('#review'); chrome.notifications.clear(id); }
+  if (id === DRIVE_NOTIF_ID) { openLibrary('#drive'); chrome.notifications.clear(id); }
 });
 chrome.notifications.onButtonClicked.addListener((id) => {
   if (id === NOTIF_ID) { openLibrary('#review'); chrome.notifications.clear(id); }
+  if (id === DRIVE_NOTIF_ID) { openLibrary('#drive'); chrome.notifications.clear(id); }
 });
+
+/* ---------- Google ドライブ同期（裏で） ---------- */
+
+const DRIVE_NOTIF_ID = 'recall-drive';
+const DRIVE_ALERT_KEY = 'rcDriveAlert';   // local: 最後に「止まっています」と知らせた時刻
+
+/**
+ * 裏で同期する。許可切れなど、待っても直らない理由で止まったら通知で知らせる（1日1回まで）。
+ * うまくいったら控えを消す（次にまた止まったときにすぐ知らせられるように）。
+ */
+async function syncDriveInBackground() {
+  const r = await syncDrive();
+  try {
+    if (r && r.ok) {
+      if ((await chrome.storage.local.get(DRIVE_ALERT_KEY))[DRIVE_ALERT_KEY]) {
+        await chrome.storage.local.remove(DRIVE_ALERT_KEY);
+        chrome.notifications.clear(DRIVE_NOTIF_ID);
+      }
+      return r;
+    }
+    const last = (await chrome.storage.local.get(DRIVE_ALERT_KEY))[DRIVE_ALERT_KEY] || 0;
+    const alert = driveAlertFor(r, last, Date.now());
+    if (!alert) return r;
+    await chrome.storage.local.set({ [DRIVE_ALERT_KEY]: Date.now() });   // 先に記録する（通知に失敗しても鳴り続けない）
+    chrome.notifications.create(DRIVE_NOTIF_ID, {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icons/icon128.png'),
+      title: alert.title,
+      message: alert.message,
+      buttons: [{ title: 'つなぎ直す' }],
+      priority: 1
+    });
+  } catch { /* 知らせられなくても、設定画面には理由が出ている */ }
+  return r;
+}
 
 /* ---------- 保存 ---------- */
 
@@ -346,7 +383,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // Google ドライブ同期（設定画面から）
   if (msg && msg.type === 'driveStatus') { driveStatus().then(sendResponse); return true; }
   if (msg && msg.type === 'driveConnect') { connectDrive().then(sendResponse); return true; }
-  if (msg && msg.type === 'driveSync') { syncDrive({ force: !msg.soft }).then(sendResponse); return true; }
+  if (msg && msg.type === 'driveSync') {
+    // soft … ライブラリを開いたときの取り込み（裏の同期と同じ扱い。止まっていれば通知する）
+    (msg.soft ? syncDriveInBackground() : syncDrive({ force: true })).then(sendResponse);
+    return true;
+  }
   if (msg && msg.type === 'driveDisconnect') { disconnectDrive().then(sendResponse); return true; }
   if (msg && msg.type === 'driveBackups') { listBackups().then(sendResponse); return true; }
   if (msg && msg.type === 'driveBackupGet') { getBackup(msg.id).then(sendResponse); return true; }

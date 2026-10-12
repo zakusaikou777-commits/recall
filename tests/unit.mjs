@@ -1334,6 +1334,16 @@ ok('バックアップから戻せる中身がある', restore.ok && restore.dat
 
 eq('ドライブのアプリ専用の領域だけを使う（ほかのファイルには触れない）', fakeDrive.violations, []);
 
+console.log('\n--- Google ドライブ同期: 止まったときの通知 ---');
+const DNOW = Date.now();
+ok('許可切れなら知らせる', !!DR.driveAlertFor({ ok: false, reason: 'auth' }, 0, DNOW));
+ok('ログアウト・Cloud の設定も知らせる', ['signin', 'clientid', 'api'].every(r => DR.driveAlertFor({ ok: false, reason: r }, 0, DNOW)));
+ok('オフライン・混雑・オフは知らせない（自動で直る・使っていない）', ['offline', 'busy', 'off', 'failed'].every(r => DR.driveAlertFor({ ok: false, reason: r }, 0, DNOW) === null));
+ok('うまくいったときは知らせない', DR.driveAlertFor({ ok: true }, 0, DNOW) === null);
+ok('同じ日のうちは2回目を出さない', DR.driveAlertFor({ ok: false, reason: 'auth' }, DNOW - 3600000, DNOW) === null);
+ok('1日たったらまた知らせる', !!DR.driveAlertFor({ ok: false, reason: 'auth' }, DNOW - DR.DRIVE_ALERT_EVERY - 1, DNOW));
+eq('通知の見出し', DR.driveAlertFor({ ok: false, reason: 'auth' }, 0, DNOW).title, 'Google ドライブとの同期が止まっています');
+
 console.log('\n--- Google ドライブ同期: やめる ---');
 await DR.disconnectDrive();
 ok('オフになる', (await S.getMeta()).s.driveOn === false);

@@ -1260,8 +1260,11 @@ await sw.evaluate(() => {
     byName(n) { return [...this.files.values()].filter(f => f.name === n); }
   };
   const res = (status, body, text) => new Response(text !== undefined ? text : JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+  const realFetch = self.fetch.bind(self);
   self.fetch = async (url, init = {}) => {
-    const u = new URL(url);
+    const u = new URL(String(url && url.url || url));
+    // Google 以外（通知のアイコンの読み込みなど）は本物に任せる
+    if (!/(^|\.)googleapis\.com$|^accounts\.google\.com$/.test(u.hostname)) return realFetch(url, init);
     const method = (init.method || 'GET').toUpperCase();
     if (u.hostname === 'accounts.google.com') return res(200, {});
     if (u.pathname === '/drive/v3/files' && method === 'GET') {
@@ -1318,6 +1321,34 @@ await waitUntil(async () => (await lib.locator('#gdMsg').innerText()).includes('
 ok('同期をやめられる', (await lib.evaluate(async () => (await chrome.storage.sync.get('meta')).meta.s.driveOn)) === false);
 ok('やめたら「つなぐ」に戻る', await waitUntil(async () => lib.locator('#gdConnect').isVisible(), 5000));
 await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
+
+// 許可が切れて裏の同期が止まったら、通知で知らせる（テスト中のアプリは許可が7日で切れることがある）
+await sw.evaluate(() => { chrome.identity.getAuthToken = async () => { throw new Error('OAuth2 not granted or revoked.'); }; });
+await lib.evaluate(async () => {
+  const m = (await chrome.storage.sync.get('meta')).meta;
+  await chrome.storage.sync.set({ meta: { ...m, s: { ...m.s, driveOn: true } } });
+  await chrome.storage.local.remove('rcDriveAlert');
+});
+const softRes = await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'driveSync', soft: true }));
+eq2('許可が切れていると同期は止まる', softRes && softRes.reason, 'auth');
+ok('「同期が止まっています」と通知する', await waitUntil(async () => 'recall-drive' in (await sw.evaluate(() => chrome.notifications.getAll())), 5000));
+await sw.evaluate(() => chrome.notifications.clear('recall-drive'));
+await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'driveSync', soft: true }));
+await lib.waitForTimeout(800);
+ok('同じ日のうちは2回目の通知を出さない', !('recall-drive' in (await sw.evaluate(() => chrome.notifications.getAll()))));
+await lib.goto('about:blank');
+await lib.goto(url('library.html#drive')); await lib.waitForTimeout(1500);       // ライブラリが開いていないとき
+ok('通知から開くと設定の「Google ドライブ同期」が出る', await lib.locator('#setDlg').evaluate(d => d.open) && await lib.locator('#gdStatus').isVisible());
+ok('そこに「つなぎ直す」がある', await waitUntil(async () => (await lib.locator('#gdConnect').innerText()).includes('つなぎ直す'), 5000));
+ok('開いたあとは一覧の表示に戻す', (await lib.evaluate(() => location.hash)) === '#all');
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
+await lib.evaluate(() => { location.hash = 'drive'; });                          // ライブラリがもう開いているとき
+ok('開いているライブラリでも設定が出る', await waitUntil(async () => lib.locator('#setDlg').evaluate(d => d.open), 5000));
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
+await lib.evaluate(async () => {
+  const m = (await chrome.storage.sync.get('meta')).meta;
+  await chrome.storage.sync.set({ meta: { ...m, s: { ...m.s, driveOn: false } } });
+});
 
 section('後片付け');
 const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));

@@ -56,6 +56,7 @@ async function boot() {
   render();
   if (new URLSearchParams(location.search).get('welcome')) $('welcome').classList.remove('hidden');
   renderVersion();
+  maybeOpenDriveSettings();
   // Google ドライブ同期中なら、開いたときに最新を取りに行く（届いた分はストレージの変更で描き直される）
   if (meta.s.driveOn) ask({ type: 'driveSync', soft: true });
   await showUpdateNotice();
@@ -84,9 +85,22 @@ function applyHash() {
     query = h.slice(2);
     const box = $('q');
     if (box) { box.value = query; $('qClear').classList.toggle('hidden', !query); }
+  } else if (h === 'drive') {                        // 「同期が止まっています」の通知から
+    view = 'all';
+    openDriveOnLoad = true;
   } else if (h) view = h;
   else view = 'all';
   pruneSelection();
+}
+
+let openDriveOnLoad = false;
+/** 通知から開いたときは、設定の「Google ドライブ同期」を開いて見せる */
+function maybeOpenDriveSettings() {
+  if (!openDriveOnLoad) return;
+  openDriveOnLoad = false;
+  try { history.replaceState(null, '', '#all'); } catch { /* 続行 */ }
+  if (!$('setDlg').open) openSettings();
+  $('gdStatus').scrollIntoView({ block: 'center' });
 }
 
 /** 表示されていない項目が選択に残らないようにする（見えない項目の一括削除を防ぐ） */
@@ -1120,7 +1134,7 @@ async function renderDriveBackups() {
 /* ---------- イベント ---------- */
 
 function bind() {
-  window.addEventListener('hashchange', () => { applyHash(); render(); });
+  window.addEventListener('hashchange', () => { applyHash(); render(); maybeOpenDriveSettings(); });
 
   $('q').addEventListener('input', () => {
     query = $('q').value.trim();
