@@ -7,7 +7,7 @@
    ものを、そのまま持ち込んでいる（取りこぼし・二重報告・タブの
    開きっぱなしを避けるための工夫がすべて入っている）。
    ============================================================ */
-import { clip, thumbOf, normalizeUrl, getAll, putItems, STATUS, DEFAULT_STEPS } from './store.js';
+import { clip, thumbOf, normalizeUrl, getAll, putItems, STATUS, DEFAULT_STEPS, CAT_COLORS } from './store.js';
 
 /** 気になり帳が受け付けるカテゴリ（これ以外は「調べる」になる） */
 export const KN_CATEGORIES = ['メモ', 'アイデア', '調べる', 'やること', '行きたい'];
@@ -681,6 +681,109 @@ export async function startClip(url, sendResponse) {
   await rememberOpened(url);
   await ensureClipAlarm();
   watch(tabId);
+}
+
+/* ============================================================
+   気になり帳のフォルダを読む（Recall のカテゴリに取り込むため）
+     気になり帳は、この Chrome の localStorage（気になり帳のサイト）に全データを持っている。
+     「保存の確認を許可する」で得たサイトへの権限で、そこを読むだけ（気になり帳には何も書かない）。
+   ============================================================ */
+
+const KN_DATA_KEY = 'kininari:data:v2';
+const FOLDER_WAIT_MS = 20000;
+export const CAT_NAME_MAX = 20;      // Recall のカテゴリ名の上限（設定画面と同じ）
+
+/**
+ * 気になり帳のデータからフォルダの名前と色を取り出す（純粋な関数）。
+ * 同じ名前のフォルダ（入れ子の別の場所にあるもの）は1つにまとめる。気になり帳も送られてきたクリップを名前で入れるため。
+ * @returns {Array<{name: string, color: string}>|null} 気になり帳のデータでなければ null
+ */
+export function foldersFromKininariData(raw) {
+  let data = raw;
+  if (typeof raw === 'string') { try { data = JSON.parse(raw); } catch { return null; } }
+  if (!data || typeof data !== 'object' || !Array.isArray(data.notebooks)) return null;
+  const out = [];
+  const seen = new Set();
+  for (const f of data.notebooks) {
+    if (!f || typeof f !== 'object') continue;
+    const name = typeof f.name === 'string' ? f.name.trim() : '';
+    if (!name || seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+    out.push({ name, color: /^#[0-9a-fA-F]{3,8}$/.test(String(f.color || '')) ? f.color : '' });
+  }
+  return out;
+}
+
+/**
+ * 気になり帳のフォルダのうち、Recall に無いものをカテゴリとして足す（純粋な関数）。
+ * 同じ名前（大文字小文字は区別しない。気になり帳の照合と同じ）のものはそのまま。消したり名前を変えたりはしない。
+ * 長すぎる名前は、Recall の上限に切り詰めると気になり帳に別のフォルダができてしまうので取り込まない。
+ */
+export function mergeFolderCats(cats, folders, makeId) {
+  const have = new Set((cats || []).map(c => String(c.name || '').trim().toLowerCase()));
+  const add = [], tooLong = [];
+  let same = 0;
+  for (const f of folders || []) {
+    const key = f.name.toLowerCase();
+    if (have.has(key)) { same++; continue; }
+    if (f.name.length > CAT_NAME_MAX) { tooLong.push(f.name); continue; }
+    const color = f.color || CAT_COLORS[((cats || []).length + add.length) % CAT_COLORS.length];
+    add.push({ id: makeId(), name: f.name, color });
+    have.add(key);
+  }
+  return { cats: [...(cats || []), ...add], added: add.map(c => c.name), same, tooLong };
+}
+
+/**
+ * 気になり帳のフォルダを読む。気になり帳のサイトのタブが開いていればそこから、無ければ裏のタブで開いて読み、閉じる。
+ * @returns {Promise<{ok: boolean, folders?: Array, reason?: string, message?: string}>}
+ */
+export async function readKininariFolders(knUrl) {
+  const base = String(knUrl || '').trim().split('#')[0];
+  const origin = originOf(base);
+  if (!origin) return { ok: false, reason: 'nourl', message: CLIP_MESSAGE.nourl };
+  if (!(await canScript(origin))) {
+    return { ok: false, reason: 'perm', message: '先に「保存の確認を許可する」を押してください（気になり帳のフォルダを読むのに使います）。' };
+  }
+  const read = async (tabId) => {
+    try {
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (key) => { try { return localStorage.getItem(key); } catch { return null; } },
+        args: [KN_DATA_KEY]
+      });
+      return r ? r.result : null;
+    } catch { return undefined; }   // まだ読み込み中・読めないページ
+  };
+  const done = (v) => {
+    const folders = v == null ? null : foldersFromKininariData(v);
+    if (!folders) return { ok: false, reason: 'nodata', message: 'この Chrome には気になり帳のデータが見つかりませんでした（このブラウザで気になり帳を開いたことがあるか確かめてください）。' };
+    return { ok: true, folders };
+  };
+  // 同じサイトのタブが開いていれば、それを使う（同じサイトなら、どのページからでも同じデータが見える）
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({ url: origin }); } catch { tabs = []; }
+  for (const t of tabs || []) {
+    if (!t || t.id == null || t.status !== 'complete') continue;
+    const v = await read(t.id);
+    if (typeof v === 'string') return done(v);
+  }
+  let tab = null;
+  try { tab = await chrome.tabs.create({ url: base, active: false }); }
+  catch (e) { return { ok: false, reason: 'failed', message: '気になり帳を開けませんでした: ' + String((e && e.message) || e) }; }
+  try {
+    const end = Date.now() + FOLDER_WAIT_MS;
+    while (Date.now() < end) {
+      if (await tabLoaded(tab.id)) {
+        const v = await read(tab.id);
+        if (v !== undefined) return done(v);
+      }
+      await sleep(400);
+    }
+    return { ok: false, reason: 'timeout', message: '気になり帳を開けませんでした。URL とネットの接続を確かめてください。' };
+  } finally {
+    try { chrome.tabs.remove(tab.id, () => void chrome.runtime.lastError); } catch { /* 続行 */ }
+  }
 }
 
 export function onClipTabUpdated(tabId, info) {

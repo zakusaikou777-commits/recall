@@ -1350,6 +1350,35 @@ await lib.evaluate(async () => {
   await chrome.storage.sync.set({ meta: { ...m, s: { ...m.s, driveOn: false } } });
 });
 
+section('1.9.0: 気になり帳のフォルダを取り込む');
+await freshStore();
+await openLib('all');
+await lib.click('#btnSettings'); await lib.waitForTimeout(800);
+await lib.fill('#sKnUrl', 'https://kn-e2e.example/app/');
+const catMsg = () => lib.locator('#catFromKnMsg').innerText();
+const catDone = async () => { const t = (await catMsg()).trim(); return !!t && !t.endsWith('…'); };
+await lib.click('#catFromKn');
+await waitUntil(catDone, 8000);
+ok('許可が無ければ「保存の確認を許可する」を求める', (await catMsg()).includes('保存の確認を許可する'));
+// 許可済みで、気になり帳のタブが開いている状態にする（中身は気になり帳と同じ形）
+await lib.evaluate((data) => {
+  chrome.permissions.contains = async () => true;
+  chrome.tabs.query = async () => [{ id: 424242, status: 'complete', url: 'https://kn-e2e.example/app/' }];
+  chrome.scripting.executeScript = async () => [{ result: JSON.stringify(data) }];
+}, { memos: [], notebooks: [{ id: 'a', name: '未分類' }, { id: 'b', name: 'オレンジカード', color: '#3E6CA3' }, { id: 'c', name: '株主優待' }] });
+await lib.click('#catFromKn');
+await waitUntil(catDone, 8000);
+ok('足りないフォルダをカテゴリに足す', (await catMsg()).includes('2 件のフォルダをカテゴリに足しました'));
+const catNamesNow = await lib.evaluate(async () => (await chrome.storage.sync.get('meta')).meta.cats.map(c => c.name));
+ok('カテゴリとして保存される', catNamesNow.includes('オレンジカード') && catNamesNow.includes('株主優待'));
+eq2('同じ名前（未分類）は二重にならない', catNamesNow.filter(n => n === '未分類').length, 1);
+ok('カテゴリの管理にも出る', (await lib.locator('#catEditor input[type=text]').evaluateAll(els => els.map(e => e.value))).includes('株主優待'));
+await lib.click('#catFromKn');
+await waitUntil(async () => (await catMsg()).includes('すべて'), 8000);
+ok('2回押しても増えない', (await catMsg()).includes('すべて Recall のカテゴリにあります'));
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(1200);
+ok('サイドバーのカテゴリにも出る', (await lib.locator('#catList').innerText()).includes('株主優待'));
+
 section('後片付け');
 const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));
 ok('バッジ API が動く', typeof badge === 'string');
