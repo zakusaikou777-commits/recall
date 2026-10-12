@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Recall ライブラリ</title>
+<link rel="stylesheet" href="base.css">
+<link rel="stylesheet" href="library.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><img src="icons/icon48.png" alt=""><b>Recall</b></div>
+  <div class="searchwrap">
+    <svg viewBox="0 0 24 24" class="sicon" aria-hidden="true"><path d="M10 3a7 7 0 105.3 11.6l4.6 4.6 1.4-1.4-4.6-4.6A7 7 0 0010 3zm0 2a5 5 0 110 10 5 5 0 010-10z"/></svg>
+    <input id="q" type="search" placeholder="タイトル・URL・メモ・タグを検索  （/ でフォーカス）" autocomplete="off">
+    <button id="qClear" class="btn ghost sm hidden">×</button>
+  </div>
+  <button id="btnSettings" class="btn ghost" title="設定">⚙ 設定</button>
+</header>
+
+<div id="updated" class="welcome hidden">
+  <div><b>Recall が <span id="updatedVer"></span> に更新されました。</b> <span id="updatedTitle"></span></div>
+  <button id="updatedShow" class="btn sm">変更点を見る</button>
+  <button id="updatedClose" class="btn sm ghost">閉じる</button>
+</div>
+
+<div id="welcome" class="welcome hidden">
+  <div>
+    <b>Recall へようこそ。</b>
+    ツールバーの <img src="icons/icon16.png" alt="" class="inlineicon"> ボタン（<kbd>Alt</kbd>+<kbd>S</kbd>）で今見ているページを保存できます。
+    保存したページは忘却曲線に沿って「今日の復習」に並びます。
+  </div>
+  <button id="welcomeClose" class="btn sm ghost">閉じる</button>
+</div>
+
+<div class="shell">
+  <aside class="side">
+    <nav id="views" class="navlist"></nav>
+
+    <div class="sectionhead">
+      <span>カテゴリ</span>
+      <button id="addCat" class="btn ghost sm" title="カテゴリを追加">＋</button>
+    </div>
+    <nav id="catList" class="navlist"></nav>
+    <div id="addCatRow" class="row addcatrow hidden">
+      <input id="newCatName" type="text" placeholder="カテゴリ名" maxlength="20">
+      <button id="newCatOk" class="btn sm primary">追加</button>
+    </div>
+
+    <div class="sectionhead"><span>タグ</span></div>
+    <div id="tagCloud" class="tagcloud"></div>
+
+    <div class="sidefoot">
+      <div class="row" style="justify-content:space-between">
+        <span class="faint" style="font-size:11.5px">保存件数</span>
+        <span id="usageText" class="faint" style="font-size:11.5px"></span>
+      </div>
+      <div class="bar" id="usageBar"><i style="width:0%"></i></div>
+      <span id="usageSync" class="faint" style="font-size:11px"></span>
+      <button id="verBtn" class="verbtn" title="更新履歴を見る"><span id="verText"></span></button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="toolbar">
+      <h1 id="viewTitle">すべて</h1>
+      <span id="viewCount" class="count"></span>
+      <button id="startReview" class="btn primary hidden">順番に復習する</button>
+      <div class="grow"></div>
+      <label class="row faint" style="font-size:12px;gap:5px">
+        <input type="checkbox" id="selMode"> 選択
+      </label>
+      <select id="sort" title="並び替え">
+        <option value="new">追加が新しい順</option>
+        <option value="old">追加が古い順</option>
+        <option value="due">復習が近い順</option>
+        <option value="title">タイトル順</option>
+        <option value="domain">サイト順</option>
+      </select>
+    </div>
+
+    <div id="bulkbar" class="bulkbar hidden">
+      <span id="bulkCount"></span>
+      <button id="bulkAll" class="btn sm ghost">全選択</button>
+      <div class="grow"></div>
+      <select id="bulkCat" class="sm"><option value="">カテゴリを変更…</option></select>
+      <input id="bulkTag" type="text" placeholder="タグを追加" style="width:130px">
+      <button id="bulkTagGo" class="btn sm">付与</button>
+      <button id="bulkDone" class="btn sm">完了に</button>
+      <button id="bulkArchive" class="btn sm">アーカイブ</button>
+      <button id="bulkDel" class="btn sm danger">削除</button>
+    </div>
+
+    <div id="list" class="list"></div>
+    <div id="empty" class="empty hidden"></div>
+  </main>
+</div>
+
+<!-- 編集ダイアログ -->
+<dialog id="editDlg" class="dlg">
+  <form method="dialog" id="editForm">
+    <h2>項目を編集</h2>
+    <div class="field"><label for="eTitle">タイトル</label><input id="eTitle" type="text"></div>
+    <div class="field"><label for="eUrl">URL</label><input id="eUrl" type="text"></div>
+    <div class="field"><label for="eCat">カテゴリ</label><select id="eCat"></select></div>
+    <div class="field"><label for="eTags">タグ（カンマ区切り）</label><input id="eTags" type="text"></div>
+    <div class="field"><label for="eNote">メモ</label><textarea id="eNote" maxlength="1200"></textarea></div>
+    <div class="two">
+      <div class="field"><label for="eIv">復習の間隔</label><select id="eIv"></select></div>
+      <div class="field"><label for="eStatus">状態</label><select id="eStatus">
+        <option value="0">未読</option><option value="1">学習中</option>
+        <option value="2">完了</option><option value="3">アーカイブ</option>
+      </select></div>
+    </div>
+    <div class="field"><label for="eDue">次回の復習日</label><input id="eDue" type="date"></div>
+    <menu>
+      <button type="button" id="eDel" class="btn danger" style="margin-right:auto" title="あとから「元に戻す」で戻せます">削除</button>
+      <button type="button" id="eCancel" class="btn">キャンセル</button>
+      <button value="save" id="eSave" class="btn primary">保存</button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- 設定ダイアログ -->
+<dialog id="setDlg" class="dlg wide">
+  <form method="dialog">
+    <h2>設定</h2>
+
+    <section>
+      <h3>復習の間隔（忘却曲線）</h3>
+      <p class="faint">「覚えた」を押すたびに、左から順に間隔が広がります（単位：日）。最後まで進むと完了になります。</p>
+      <input id="sSteps" type="text" placeholder="1, 3, 7, 14, 30, 60, 120">
+      <div class="two" style="margin-top:10px">
+        <div class="field"><label for="sFirst">保存してから最初の復習まで（日）</label><input id="sFirst" type="number" min="0" max="365"></div>
+        <div class="field"><label for="sAgain">「まだ」を押したとき</label>
+          <select id="sAgain"><option value="reset">最初の間隔に戻す</option><option value="back">1段階だけ戻す</option></select></div>
+      </div>
+    </section>
+
+    <section>
+      <h3>表示</h3>
+      <label class="check"><input type="checkbox" id="sThumbs"> サムネイル画像を表示する（画像はURLだけ保存され、表示時に元のサイトから読み込みます）</label>
+      <label class="check"><input type="checkbox" id="sEmbed"> YouTube をライブラリ内でそのまま再生できるようにする</label>
+    </section>
+
+    <section>
+      <h3>気になり帳へ送る</h3>
+      <p class="faint">
+        保存したページを「気になり帳」にも送ります。気になり帳は Google ドライブで同期されるので、
+        スマホからも同じものを見られます。送るのは新しく保存したときだけで、更新のたびには送りません。
+      </p>
+      <label class="check"><input type="checkbox" id="sKnOn"> 保存したページを気になり帳にも送る</label>
+      <div class="field">
+        <label for="sKnUrl">気になり帳の URL（kininari.html）</label>
+        <input id="sKnUrl" type="text" placeholder="https://yourname.github.io/app/kininari.html" spellcheck="false">
+      </div>
+      <div class="two">
+        <div class="field">
+          <label for="sKnCat">気になり帳側のカテゴリ</label>
+          <select id="sKnCat"></select>
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <button type="button" id="sKnPerm" class="btn">保存の確認を許可する</button>
+        </div>
+      </div>
+      <div id="sKnMsg" class="faint" style="font-size:11.5px"></div>
+      <div id="sKnQueue" class="knqueue hidden">
+        <div class="row">
+          <b id="sKnQueueCount"></b>
+          <div class="grow"></div>
+          <button type="button" id="sKnFlush" class="btn sm">今すぐ送る</button>
+        </div>
+        <ul id="sKnQueueList" class="knqlist"></ul>
+        <div class="faint" style="font-size:11.5px">送れなかった項目は5分ごとに自動で送り直します。保存先URLを直すとすぐに再送します。</div>
+      </div>
+      <p class="faint" style="margin-top:8px">
+        Recall のカテゴリは、気になり帳では同じ名前の<b>フォルダ</b>になります。タグはメモ本文の末尾に <code>#タグ</code> として付きます。
+      </p>
+    </section>
+
+    <section>
+      <h3>同期</h3>
+      <p class="faint">本体はこの端末に保存されます（容量無制限）。そのうち更新が新しいものだけを Chrome アカウントで同期し、他の PC でも見られるようにします。</p>
+      <label class="check"><input type="checkbox" id="sSync"> Chrome アカウントで同期する</label>
+      <div class="field" style="max-width:220px">
+        <label for="sSyncMax">同期する件数の上限</label>
+        <input id="sSyncMax" type="number" min="0" max="500" step="1">
+      </div>
+    </section>
+
+    <section>
+      <h3>通知</h3>
+      <label class="check"><input type="checkbox" id="sNotify"> 復習の通知を出す（1日1回）</label>
+      <label class="check"><input type="checkbox" id="sBadge"> アイコンに未復習の件数バッジを表示</label>
+      <div class="field" style="max-width:180px;margin-top:8px">
+        <label for="sHour">通知する時刻</label>
+        <select id="sHour"></select>
+      </div>
+    </section>
+
+    <section>
+      <h3>保存の初期値</h3>
+      <div class="two">
+        <div class="field"><label for="sCat">カテゴリ</label><select id="sCat"></select></div>
+        <div class="field"><label for="sIv">間隔</label><select id="sIv"></select></div>
+      </div>
+    </section>
+
+    <section>
+      <h3>カテゴリの管理</h3>
+      <div id="catEditor" class="cateditor"></div>
+    </section>
+
+    <section>
+      <h3>バックアップ / 移行</h3>
+      <p class="faint">同期ストレージは約100KB・500件までです。書き出しておけば、いっぱいになっても安心です。</p>
+      <div class="row" style="flex-wrap:wrap">
+        <button type="button" id="expJson" class="btn">JSONで書き出し</button>
+        <button type="button" id="expCsv" class="btn">CSVで書き出し</button>
+        <button type="button" id="impBtn" class="btn">JSONを読み込み</button>
+        <input type="file" id="impFile" accept="application/json,.json" class="hidden">
+        <div class="grow"></div>
+        <button type="button" id="wipe" class="btn danger">すべて削除</button>
+      </div>
+      <div id="setMsg" class="faint" style="margin-top:8px"></div>
+    </section>
+
+    <menu><button value="close" class="btn primary">閉じる</button></menu>
+  </form>
+</dialog>
+
+<!-- バージョン情報と更新履歴 -->
+<dialog id="aboutDlg" class="dlg wide">
+  <form method="dialog">
+    <div class="abouthead">
+      <img src="icons/icon48.png" alt="" width="40" height="40">
+      <div>
+        <h2>Recall — 復習ブックマーク</h2>
+        <div class="faint" id="aboutVer"></div>
+      </div>
+    </div>
+    <p class="faint">
+      保存したページを、忘却曲線に沿ったタイミングで復習するための Chrome 拡張機能です。
+      データはこの端末と Chrome アカウントの同期ストレージにのみ保存され、外部のサーバーへは送信されません。
+    </p>
+    <section>
+      <h3>更新履歴</h3>
+      <div id="changelog" class="changelog"></div>
+    </section>
+    <menu><button value="close" class="btn primary">閉じる</button></menu>
+  </form>
+</dialog>
+
+<!-- 集中復習 -->
+<div id="focus" class="focus hidden">
+  <div class="fcard">
+    <div class="frow">
+      <span id="fProgress" class="faint"></span>
+      <div class="grow"></div>
+      <button id="fClose" class="btn ghost sm">終了 (Esc)</button>
+    </div>
+    <div id="fThumb" class="fthumb hidden"></div>
+    <div class="fhead">
+      <img id="fFav" class="favicon" alt="">
+      <span id="fCat" class="chip"></span>
+      <span id="fDom" class="faint"></span>
+    </div>
+    <a id="fTitle" class="ftitle" target="_blank" rel="noopener"></a>
+    <div id="fNote" class="fnote"></div>
+    <div id="fTags" class="ftags"></div>
+    <div class="fbtns">
+      <button id="fAgain" class="btn">まだ<span class="sub" id="fAgainSub"></span></button>
+      <button id="fLater" class="btn">あとで<span class="sub">明日</span></button>
+      <button id="fOk" class="btn primary">覚えた<span class="sub" id="fOkSub"></span></button>
+    </div>
+    <div class="frow2">
+      <button id="fOpen" class="btn ghost sm">ページを開く</button>
+      <button id="fEdit" class="btn ghost sm">編集</button>
+      <button id="fDone" class="btn ghost sm">完了にする</button>
+      <button id="fArch" class="btn ghost sm">アーカイブ</button>
+      <button id="fDel" class="btn ghost sm danger" title="あとから「元に戻す」で戻せます">削除</button>
+    </div>
+  </div>
+</div>
+
+<!-- お知らせ（削除の「元に戻す」など） -->
+<div id="toast" class="toast hidden" role="status" aria-live="polite">
+  <span id="toastMsg"></span>
+  <button type="button" id="toastUndo" class="btn sm">元に戻す</button>
+  <button type="button" id="toastClose" class="btn ghost sm" aria-label="閉じる">✕</button>
+</div>
+
+<script type="module" src="library.js"></script>
+</body>
+</html>

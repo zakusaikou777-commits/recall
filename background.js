@@ -81,7 +81,7 @@ function buildMenus() {
 chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name === TICK) await refresh();
   if (a.name === CLIP_ALARM) await sweepClips();
-  if (a.name === RETRY_ALARM) await flushClips();   // 送れなかった分の再送
+  if (a.name === RETRY_ALARM) await flushClips({ retry: true });   // 送れなかった分の再送（5分ごと）
 });
 
 chrome.tabs.onUpdated.addListener(onClipTabUpdated);
@@ -288,6 +288,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg && msg.type === 'clipForget') { removeFromQueue(msg.id).then(() => sendResponse({ ok: true })); return true; }
+  if (msg && msg.type === 'clipRequeue') {
+    // 「元に戻す」で戻した項目を、気になり帳へ送る順番待ちに並べ直す。
+    // 待ち行列の書き換えは Service Worker の中で順番に行う（画面から直接書くと取り合いになる）
+    (async () => {
+      for (const id of (Array.isArray(msg.ids) ? msg.ids : [])) await enqueueClip(id);
+      flushClips();
+    })().then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
+    return true;
+  }
   if (msg && msg.type === 'openLibrary') { openLibrary(msg.hash || ''); sendResponse({ ok: true }); return false; }
   return false;
 });

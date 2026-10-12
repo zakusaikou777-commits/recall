@@ -5,6 +5,7 @@
    ============================================================ */
 import path from 'node:path';
 import http from 'node:http';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const EXT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -256,7 +257,8 @@ ok('通知時刻が保存される', m.hour === 21);
 
 // 回帰: 以前は「すべて削除」の後に閉じると古い設定が書き戻っていた
 await lib.click('#btnSettings'); await lib.waitForTimeout(400);
-lib.once('dialog', d => d.accept());
+// confirm は差し替えるので、ダイアログの受け手は登録しない
+// （登録すると使われないまま残り、あとのテストのダイアログを二重に処理してしまう）
 await lib.evaluate(() => { window.confirm = () => true; });
 await lib.click('#wipe'); await lib.waitForTimeout(WAIT);
 await lib.locator('#setDlg button[value=close]').click();
@@ -694,6 +696,74 @@ await lib.click('#eSave'); await lib.waitForTimeout(WAIT);
 const richAfterEdit = await lib.evaluate(async (id) => (await chrome.storage.local.get('R:' + id))['R:' + id], target.id);
 ok('編集してもサムネイル情報が残る', richAfterEdit && richAfterEdit.th === 'https://example.com/keep.png');
 
+section('削除と元に戻す');
+await lib.goto(url('library.html#all')); await lib.waitForTimeout(900);
+const nCards = await lib.locator('#list .card').count();
+ok('カードに削除ボタンがある', (await lib.locator('#list .card button.del').count()) === nCards);
+// 消す前に、サムネイル情報と復習の進み具合を持たせておく（戻したときに失われないか見る）
+await lib.evaluate(async (vid) => {
+  const k = 'L:' + vid; const v = (await chrome.storage.local.get(k))[k];
+  v.rv = 4; v.b = 3; v.s = 1; await chrome.storage.local.set({ [k]: v });
+}, target.id);
+await lib.reload(); await lib.waitForTimeout(1200);
+const victimCard = lib.locator('#list .card').filter({ has: lib.locator(`a.title`, { hasText: (await readItems()).find(i => i.id === target.id).t }) }).first();
+await victimCard.locator('button.del').click();
+await lib.waitForTimeout(WAIT);
+eq2('削除ボタンで一覧から消える', await lib.locator('#list .card').count(), nCards - 1);
+ok('端末内からも消える', !(await readItems()).some(i => i.id === target.id));
+ok('「元に戻す」が出る', await lib.locator('#toastUndo').isVisible());
+ok('何を消したかが出る', (await lib.locator('#toastMsg').innerText()).includes('を削除しました'));
+await lib.click('#toastUndo'); await lib.waitForTimeout(WAIT);
+eq2('元に戻すとカードが戻る', await lib.locator('#list .card').count(), nCards);
+const backItem = (await readItems()).find(i => i.id === target.id);
+ok('復習の進み具合も元どおり', !!backItem && backItem.rv === 4 && backItem.b === 3 && backItem.s === 1);
+const richBack = await lib.evaluate(async (vid) => (await chrome.storage.local.get('R:' + vid))['R:' + vid], target.id);
+ok('サムネイル情報も戻る', !!richBack && richBack.th === 'https://example.com/keep.png');
+const delRec = await lib.evaluate(async () => (await chrome.storage.sync.get('del')).del || []);
+ok('削除の記録は外れる（他の PC で消されない）', !delRec.some(d => d.i === target.id));
+ok('戻したことを知らせる', (await lib.locator('#toastMsg').innerText()).includes('元に戻しました'));
+ok('戻したあとは「元に戻す」を出さない', !(await lib.locator('#toastUndo').isVisible()));
+
+await lib.locator('#list .card').first().locator('button.del').click(); await lib.waitForTimeout(WAIT);
+eq2('もう一度消す', await lib.locator('#list .card').count(), nCards - 1);
+await lib.keyboard.press('Control+z'); await lib.waitForTimeout(WAIT);
+eq2('Ctrl+Z でも戻る', await lib.locator('#list .card').count(), nCards);
+
+await lib.locator('#list .card').first().locator('button', { hasText: '編集' }).click(); await lib.waitForTimeout(400);
+await lib.click('#eDel'); await lib.waitForTimeout(WAIT);
+ok('編集ダイアログからも削除できる',
+  !(await lib.locator('#editDlg').isVisible()) && (await lib.locator('#list .card').count()) === nCards - 1);
+await lib.click('#toastUndo'); await lib.waitForTimeout(WAIT);
+eq2('編集ダイアログからの削除も戻せる', await lib.locator('#list .card').count(), nCards);
+
+await lib.check('#selMode'); await lib.waitForTimeout(300);
+await lib.click('#bulkAll'); await lib.waitForTimeout(300);
+lib.once('dialog', d => d.accept().catch(() => {}));
+await lib.click('#bulkDel'); await lib.waitForTimeout(WAIT);
+eq2('選択してまとめて削除', await lib.locator('#list .card').count(), 0);
+ok('件数を知らせる', (await lib.locator('#toastMsg').innerText()).includes(`${nCards} 件を削除しました`));
+await lib.click('#toastUndo'); await lib.waitForTimeout(WAIT);
+eq2('まとめて削除も元に戻せる', await lib.locator('#list .card').count(), nCards);
+await lib.uncheck('#selMode'); await lib.waitForTimeout(300);
+
+// 集中復習で「不要」と判断したら、その場で消して次へ
+await lib.evaluate(async () => {
+  const ls = await chrome.storage.local.get(null);
+  const patch = {};
+  for (const [k, v] of Object.entries(ls)) if (k.startsWith('L:')) { v.s = 1; v.d = Date.now() - 86400000; patch[k] = v; }
+  await chrome.storage.local.set(patch);
+});
+await lib.goto(url('library.html#review')); await lib.waitForTimeout(1000);
+const dueN = await lib.locator('#list .card').count();
+await lib.click('#startReview'); await lib.waitForTimeout(500);
+await lib.click('#fDel'); await lib.waitForTimeout(WAIT);
+eq2('集中復習から削除すると次へ進む', (await lib.locator('#fProgress').innerText()).trim(), `2 / ${dueN}`);
+ok('集中復習の上にも「元に戻す」が出る', await lib.locator('#toastUndo').isVisible());
+await lib.click('#toastUndo'); await lib.waitForTimeout(WAIT);
+await lib.click('#fClose'); await lib.waitForTimeout(500);
+await lib.goto(url('library.html#review')); await lib.waitForTimeout(1000);
+eq2('集中復習で消したものも元に戻せる', await lib.locator('#list .card').count(), dueN);
+
 section('バックアップ');
 const dump = await lib.evaluate(async () => {
   const ls = await chrome.storage.local.get(null);
@@ -765,6 +835,297 @@ ok('端末内へ移行される', (await readItems()).length === 2);
 await lib.reload(); await lib.waitForTimeout(1200);
 ok('再読み込みしても増えない', (await readItems()).length === 2);
 ok('復習の進み具合が保たれる', (await readItems()).every(i => typeof i.b === 'number' && typeof i.rv === 'number'));
+
+/* ---------- 1.8.1 の回帰テスト（自分で用意した項目だけで確かめる） ---------- */
+const freshStore = async () => {
+  // 先に読み込み直して、前のテストでまだ動いている保存（遅くした同期など）を止めてから空にする
+  await lib.reload(); await lib.waitForTimeout(1000);
+  await lib.evaluate(async () => { await chrome.storage.sync.clear(); await chrome.storage.local.clear(); });
+  await lib.waitForTimeout(600);
+};
+const seedItems = (n, opts = {}) => lib.evaluate(async ({ n, opts }) => {
+  const now = Date.now();
+  const patch = {};
+  const ids = [];
+  for (let i = 0; i < n; i++) {
+    const id = `${opts.prefix || 'r'}${i}${now.toString(36)}`;
+    ids.push(id);
+    patch['L:' + id] = {
+      id, u: `https://regress.example/${opts.prefix || 'r'}/${i}`, t: `${opts.title || '回帰'} ${i}`, n: '', c: 'c0', g: [],
+      s: 1, f: 0, b: opts.b ?? 1, d: opts.due ? now - 86400000 : now + 5 * 86400000,
+      cr: now - i * 60000, rv: 2, iv: 0, kn: opts.kn || 0, knc: 0, up: now - 1000
+    };
+  }
+  await chrome.storage.local.set(patch);
+  return ids;
+}, { n, opts });
+const openLib = async (hash) => {          // 読み込み直して、前のテストの状態（お知らせ・差し替え）を持ち越さない
+  await lib.goto(url('library.html#' + hash)); await lib.reload(); await lib.waitForTimeout(1200);
+};
+const waitUntil = async (fn, ms = 10000) => {   // 時間で決め打ちせず、条件がそろうまで待つ
+  const end = Date.now() + ms;
+  while (Date.now() < end) { if (await fn()) return true; await lib.waitForTimeout(150); }
+  return false;
+};
+const dblClick = async (loc, gap = 120) => {     // 人のダブルクリック（2回目は detail=2 になる）
+  const b = await loc.boundingBox();
+  if (!b) { ok('ダブルクリックする対象が見えている', false); return; }   // 見えなければ失敗として記録し、先へ進む
+  const x = b.x + b.width / 2, y = b.y + b.height / 2;
+  await lib.mouse.move(x, y);
+  await lib.mouse.down({ clickCount: 1 }); await lib.mouse.up({ clickCount: 1 });
+  await lib.waitForTimeout(gap);
+  await lib.mouse.down({ clickCount: 2 }); await lib.mouse.up({ clickCount: 2 });
+};
+const slowSync = () => lib.evaluate(() => {     // 同期の読み書きが遅いとき（1秒近くかかることがある）を再現する
+  const s = chrome.storage.sync;
+  for (const fn of ['get', 'set', 'remove']) {
+    const orig = s[fn].bind(s);
+    s[fn] = async (...a) => { await new Promise(r => setTimeout(r, 300)); return orig(...a); };
+  }
+});
+const toastText = () => lib.locator('#toastMsg').innerText();
+const itemCount = async () => (await readItems()).length;
+
+section('回帰: 削除の二度押しと、まとめて元に戻す');
+await freshStore();
+await seedItems(6);
+await openLib('all');
+eq2('6件並ぶ', await lib.locator('#list .card').count(), 6);
+// 以前は1回目で一覧が詰まり、2回目が次のカードの削除ボタンに当たって2件消えていた
+await dblClick(lib.locator('#list .card').first().locator('button.del'));
+await waitUntil(async () => (await itemCount()) < 6);
+await lib.waitForTimeout(1000);
+eq2('回帰: 削除ボタンのダブルクリックで消えるのは1件だけ', await itemCount(), 5);
+ok('お知らせは1件分', /^「.+」を削除しました/.test(await toastText()));
+await lib.click('#toastUndo');
+await waitUntil(async () => (await itemCount()) === 6);
+eq2('元に戻せる', await itemCount(), 6);
+
+// 以前は2件目を消すと1件目の「元に戻す」が消え、1件目は戻せなくなっていた
+await lib.waitForTimeout(500);
+await lib.locator('#list .card').nth(0).locator('button.del').click();
+await waitUntil(async () => (await itemCount()) === 5);
+await lib.waitForTimeout(600);
+await lib.locator('#list .card').nth(1).locator('button.del').click();
+await waitUntil(async () => (await itemCount()) === 4);
+await lib.waitForTimeout(300);
+ok('回帰: 続けて消すと1つのお知らせにまとまる', (await toastText()).includes('2 件を削除しました'));
+await lib.click('#toastUndo');
+await waitUntil(async () => (await itemCount()) === 6);
+eq2('回帰: 「元に戻す」で2件とも戻る', await itemCount(), 6);
+await waitUntil(async () => (await toastText()).includes('2 件を元に戻しました'), 5000);
+ok('2件戻したと知らせる', (await toastText()).includes('2 件を元に戻しました'));
+
+for (let i = 0; i < 3; i++) {
+  const before = await itemCount();
+  await lib.locator('#list .card').first().locator('button.del').click();
+  await waitUntil(async () => (await itemCount()) === before - 1);
+  await lib.waitForTimeout(500);
+}
+ok('3件続けて消すとまとめて知らせる', (await toastText()).includes('3 件を削除しました'));
+await lib.keyboard.press('Control+z');
+await waitUntil(async () => (await itemCount()) === 6);
+eq2('回帰: Ctrl+Z でもまとめて戻る', await itemCount(), 6);
+
+// 以前は、戻している間に別の項目を消すと、戻し終わりのお知らせがその「元に戻す」を消していた
+await openLib('all');
+await slowSync();
+const tB = await lib.locator('#list .card a.title').nth(1).innerText();
+await lib.locator('#list .card').first().locator('button.del').click();
+await waitUntil(async () => lib.locator('#toastUndo').isVisible());
+await lib.click('#toastUndo');                                          // 1件目を戻し始める（同期が遅い）
+await lib.waitForTimeout(200);
+await lib.locator('#list .card').filter({ has: lib.locator('a.title', { hasText: tB }) }).locator('button.del').click();
+await waitUntil(async () => (await itemCount()) === 5 && !(await readItems()).some(i => i.t === tB), 12000);
+await lib.waitForTimeout(2500);                                         // 戻し終わるのを待つ
+ok('回帰: 戻している間に消した分の「元に戻す」が残る',
+  (await lib.locator('#toastUndo').isVisible()) && (await toastText()).includes(tB));
+await lib.keyboard.press('Control+z');
+await waitUntil(async () => (await itemCount()) === 6, 12000);
+eq2('そのまま戻せる', await itemCount(), 6);
+await waitUntil(async () => (await toastText()).includes('元に戻しました'), 12000);   // 戻し終わるまで待つ
+
+section('回帰: 集中復習の連打');
+await freshStore();
+await seedItems(5, { prefix: 'f', title: '集中', due: true });
+await openLib('review');
+await lib.click('#startReview'); await lib.waitForTimeout(700);
+const prog = async () => (await lib.locator('#fProgress').innerText()).trim();
+const rvOf = async () => Object.fromEntries((await readItems()).map(i => [i.t, i.rv]));
+eq2('1枚目から始まる', await prog(), '1 / 5');
+await dblClick(lib.locator('#fOk'));
+await lib.waitForTimeout(1500);
+eq2('回帰: 「覚えた」のダブルクリックで進むのは1枚だけ', await prog(), '2 / 5');
+const rvNow = await rvOf();
+eq2('回帰: 見ていない次のカードには答えていない', JSON.stringify([rvNow['集中 0'], rvNow['集中 1']]), '[3,2]');
+await lib.waitForTimeout(500);
+await dblClick(lib.locator('#fDel'));
+await lib.waitForTimeout(1500);
+eq2('回帰: 「削除」のダブルクリックで進むのは1枚だけ', await prog(), '3 / 5');
+eq2('消えたのは1件だけ', await itemCount(), 4);
+ok('次のカードは消えていない', (await readItems()).some(i => i.t === '集中 2'));
+await lib.click('#toastUndo');
+await waitUntil(async () => (await itemCount()) === 5);
+await lib.waitForTimeout(600);
+await lib.keyboard.press('3');
+await lib.waitForTimeout(100);
+await lib.keyboard.press('3');
+await lib.waitForTimeout(1500);
+eq2('回帰: キーの連打でも進むのは1枚だけ', await prog(), '4 / 5');
+// 同期が遅いとき: 保存している間の2回目のクリックは受け付けない（同じ項目を二重に記録しない）
+await slowSync();
+await lib.waitForTimeout(600);
+const okBox = await lib.locator('#fOk').boundingBox();
+ok('集中復習が続いている', !!okBox);
+if (okBox) {
+  await lib.mouse.click(okBox.x + okBox.width / 2, okBox.y + okBox.height / 2);
+  await lib.waitForTimeout(150);
+  await lib.mouse.click(okBox.x + okBox.width / 2, okBox.y + okBox.height / 2);
+}
+await waitUntil(async () => (await prog()) !== '4 / 5', 8000);
+await lib.waitForTimeout(1500);
+eq2('回帰: 保存中のクリックで2枚進まない', await prog(), '5 / 5');
+const slow3 = (await readItems()).find(i => i.t === '集中 3') || {};
+eq2('回帰: 同じ項目を二重に記録しない', JSON.stringify([slow3.rv, slow3.b]), '[3,2]');
+if (await lib.locator('#fClose').isVisible()) { await lib.click('#fClose'); await lib.waitForTimeout(400); }
+
+section('回帰: 集中復習の「まだ」に出す日数');
+await freshStore();
+await lib.evaluate(async () => { await chrome.storage.sync.set({ meta: { s: { againMode: 'back' } } }); });
+await seedItems(1, { prefix: 'g', title: '段位3', due: true, b: 3 });
+await openLib('review');
+await lib.click('#startReview'); await lib.waitForTimeout(600);
+eq2('回帰: 「まだ」の日数が実際の予定と合う（1段階だけ戻す設定）', (await lib.locator('#fAgainSub').innerText()).trim(), '7日後');
+eq2('「覚えた」の日数', (await lib.locator('#fOkSub').innerText()).trim(), '次は30日後');
+await lib.click('#fAgain');
+await waitUntil(async () => (await readItems())[0].b === 2);
+const g3 = (await readItems())[0];
+eq2('実際に入った予定も7日後',
+  Math.round((new Date(g3.d).setHours(0, 0, 0, 0) - new Date().setHours(0, 0, 0, 0)) / 86400000), 7);
+
+section('回帰: 開いている間に届いた変更を巻き戻さない');
+await freshStore();
+const [exId] = await seedItems(1, { prefix: 'e', title: '編集' });
+await openLib('all');
+await lib.locator('#list .card').first().locator('button', { hasText: '編集' }).click();
+await lib.waitForTimeout(400);
+// 編集ダイアログを開いている間に、気になり帳へ送った印が付き、他の PC でタイトルが直された
+await lib.evaluate(async (id) => {
+  const k = 'L:' + id; const v = (await chrome.storage.local.get(k))[k];
+  Object.assign(v, { kn: Date.now(), knc: 1, t: '他の PC で直したタイトル', up: Date.now() });
+  await chrome.storage.local.set({ [k]: v });
+}, exId);
+await lib.waitForTimeout(600);
+await lib.fill('#eNote', '開いている間に書いたメモ');
+await lib.click('#eSave');
+await waitUntil(async () => ((await readItems()).find(i => i.id === exId) || {}).n === '開いている間に書いたメモ');
+const exAfter = (await readItems()).find(i => i.id === exId);
+eq2('メモは保存される', exAfter.n, '開いている間に書いたメモ');
+ok('回帰: 開いている間に付いた「送った印」が消えない', exAfter.kn > 0 && exAfter.knc === 1);
+eq2('回帰: 触っていない欄は、ほかで直した内容のまま', exAfter.t, '他の PC で直したタイトル');
+
+// カテゴリの管理: 開いている間に画面が読み直されても、名前や色の変更が保存される
+await lib.click('#btnSettings'); await lib.waitForTimeout(500);
+await lib.evaluate(async () => { await chrome.storage.local.set({ e2eTouch: Date.now() }); });   // 別の処理による書き込み
+await lib.waitForTimeout(600);
+await lib.locator('#catEditor .caterow').nth(1).locator('input[type=color]')
+  .evaluate(el => { el.value = '#ff0000'; el.dispatchEvent(new Event('change')); });
+const catAt = (i) => lib.evaluate(async (i) => ((await chrome.storage.sync.get('meta')).meta || { cats: [] }).cats[i], i);
+await waitUntil(async () => ((await catAt(1)) || {}).color === '#ff0000', 5000);
+eq2('回帰: カテゴリの色の変更が保存される', ((await catAt(1)) || {}).color, '#ff0000');
+await lib.locator('#catEditor .caterow').nth(2).locator('input[type=text]').fill('改名テスト');
+await lib.locator('#catEditor .caterow').nth(2).locator('input[type=text]').dispatchEvent('change');
+await waitUntil(async () => ((await catAt(2)) || {}).name === '改名テスト', 5000);
+eq2('回帰: カテゴリの名前の変更が保存される', ((await catAt(2)) || {}).name, '改名テスト');
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(1500);
+await lib.evaluate(async () => { await chrome.storage.local.remove('e2eTouch'); });
+
+section('回帰: 読み込みで URL を確かめる');
+await openLib('all');
+const beforeImp = await itemCount();
+await lib.click('#btnSettings'); await lib.waitForTimeout(400);
+await lib.setInputFiles('#impFile', {
+  name: 'mixed.json', mimeType: 'application/json',
+  buffer: Buffer.from(JSON.stringify({ app: 'recall', version: 2, items: [
+    { url: 'https://import-ok.example/1', title: '読み込める' },
+    { title: 'URL なし' },
+    { url: 'javascript:alert(1)', title: 'スクリプト' },
+    null
+  ] }))
+});
+await waitUntil(async () => /読み込みました|ありませんでした|中断/.test(await lib.locator('#setMsg').innerText()));
+const impMsg = await lib.locator('#setMsg').innerText();
+ok('1件だけ読み込む', impMsg.includes('1 件を読み込みました'));
+ok('回帰: 読み込まなかった件数を知らせる', impMsg.includes('3 件は読み込みませんでした'));
+const afterImp = await readItems();
+eq2('回帰: URL の無い項目や javascript: は保存しない', afterImp.length, beforeImp + 1);
+ok('保存したのは http(s) の項目だけ', afterImp.every(i => /^https?:\/\//.test(i.u)));
+
+// CSV: = で始まるタイトルが数式として実行されないように
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(1200);
+await seedItems(1, { prefix: 'csv', title: '=1+2' });
+await openLib('all');
+await lib.click('#btnSettings'); await lib.waitForTimeout(400);
+const [csvDl] = await Promise.all([lib.waitForEvent('download'), lib.click('#expCsv')]);
+const csvText = fs.readFileSync(await csvDl.path(), 'utf8');
+ok('回帰: CSV では = で始まるタイトルの前に \' を付ける', csvText.includes(`"'=1+2 0"`) && !csvText.includes(`"=1+2 0"`));
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(1200);
+
+section('回帰: 元に戻すと、気になり帳へ送る順番待ちに並び直す');
+await freshStore();
+// 送れない保存先（data: URL）にしておくと、項目は送信待ちのまま残る
+await lib.evaluate(async () => {
+  await chrome.storage.sync.set({ meta: { s: { knOn: true, knUrl: 'data:text/html,kininari', knCat: '調べる' } } });
+});
+await lib.waitForTimeout(1000);
+const requeueSave = await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'quickSave', url: 'https://requeue.example/1', title: '送信待ちのまま消す' }));
+const qid = requeueSave && requeueSave.item && requeueSave.item.id;
+const queueIds = () => lib.evaluate(async () => ((await chrome.storage.local.get('rcClipQueue')).rcClipQueue || []).map(e => e.id));
+await waitUntil(async () => (await queueIds()).includes(qid));
+ok('送信待ちに並んでいる', (await queueIds()).includes(qid));
+await openLib('all');
+await lib.locator('#list .card').first().locator('button.del').click();
+await waitUntil(async () => !(await readItems()).some(i => i.id === qid));
+// 消している間に送信が走ると、消えた項目は待ち行列から外される
+await waitUntil(async () => {
+  await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'clipFlush' }));
+  return !(await queueIds()).includes(qid);
+}, 6000);
+ok('（前提）消している間に待ち行列から外れた', !(await queueIds()).includes(qid));
+await lib.click('#toastUndo');
+await waitUntil(async () => (await queueIds()).includes(qid));
+ok('回帰: 元に戻すと、送信待ちに並び直す', (await queueIds()).includes(qid));
+
+// 以前は Service Worker が起き直すたび（タブの更新でも起きる）に送り直し、5回の試行をすぐ使い切っていた
+const triesOf = async (id) => ((await lib.evaluate(async () => (await chrome.storage.local.get('rcClipQueue')).rcClipQueue || []))
+  .find(e => e.id === id) || {}).tries;
+await waitUntil(async () => (await triesOf(qid)) >= 1);
+const triesBefore = await triesOf(qid);
+const cdp = await ctx.newCDPSession(lib);
+for (let i = 0; i < 2; i++) {
+  await cdp.send('ServiceWorker.enable');
+  await cdp.send('ServiceWorker.stopAllWorkers');        // 30秒放置で止まったのと同じ状態にする
+  await lib.waitForTimeout(800);
+  await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'clipQueue' }).catch(() => null));   // 何かのきっかけで起き直す
+  await lib.waitForTimeout(2000);
+}
+eq2('回帰: 起き直しのたびには送り直さない（前回の失敗から間をあける）', await triesOf(qid), triesBefore);
+await cdp.detach().catch(() => {});
+// 起き直した Service Worker をつかみ直す（後片付けで使う）
+sw = ctx.serviceWorkers().filter(w => w.url().includes(id)).pop() || await ctx.waitForEvent('serviceworker', { timeout: 10000 });
+await lib.evaluate(async (id) => {
+  await chrome.runtime.sendMessage({ type: 'clipForget', id });
+  await chrome.storage.sync.set({ meta: { s: { knOn: false } } });
+}, qid);
+// 未確認の送信（kn だけ）でも「気になり帳に残ります」と知らせる
+await freshStore();
+await seedItems(1, { prefix: 'k', title: '送信済み（未確認）', kn: Date.now() });
+await openLib('all');
+await lib.locator('#list .card').first().locator('button.del').click();
+await waitUntil(async () => lib.locator('#toastUndo').isVisible());
+ok('回帰: 未確認の送信でも「気になり帳に残ります」と出す', (await toastText()).includes('気になり帳に送った分は'));
+await lib.click('#toastUndo');
+await waitUntil(async () => (await itemCount()) === 1);
 
 section('後片付け');
 const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));

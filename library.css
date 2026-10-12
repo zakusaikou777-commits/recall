@@ -204,3 +204,14 @@ kbd { background: var(--surface); border: 1px solid var(--border-strong); border
 .knqlist { margin: 0; padding-left: 18px; max-height: 130px; overflow-y: auto; }
 .knqlist li { font-size: 12px; color: var(--text-dim); margin-bottom: 2px; }
 .knqlist li span { color: var(--text-faint); }
+
+/* 削除ボタン（カード）。ふだんは控えめ、指を乗せたときだけ赤く */
+.card .acts .del:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
+
+/* お知らせ（削除の「元に戻す」）。集中復習の幕より上に出す */
+.toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 80;
+  display: flex; align-items: center; gap: 10px; max-width: min(640px, calc(100vw - 32px));
+  padding: 10px 10px 10px 16px; border-radius: 12px; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); box-shadow: 0 12px 32px -12px rgba(0,0,0,.55); font-size: 13px; }
+.toast #toastMsg { flex: 1; min-width: 0; line-height: 1.5; }
+.toast.hidden { display: none; }

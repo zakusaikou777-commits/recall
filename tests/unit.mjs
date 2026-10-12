@@ -11,9 +11,13 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 function makeArea(limits) {
   const mem = {};
   const size = (k, v) => new TextEncoder().encode(k + JSON.stringify(v)).length;
-  return {
+  // latency を入れると、読み書きの途中に別の処理が割り込む状況（同期が遅いとき）を作れる
+  const area = {
     _mem: mem,
+    latency: 0,
+    errors: [],                                  // 握りつぶされた書き込みエラーも後から確かめられるように
     get: async (k) => {
+      if (area.latency) await new Promise(r => setTimeout(r, area.latency));
       if (k === null || k === undefined) return { ...mem };
       const keys = [].concat(k);
       const out = {};
@@ -21,23 +25,35 @@ function makeArea(limits) {
       return out;
     },
     set: async (obj) => {
+      if (area.latency) await new Promise(r => setTimeout(r, area.latency));
+      const fail = (msg) => { area.errors.push(msg); throw new Error(msg); };
       for (const [k, v] of Object.entries(obj)) {
-        if (size(k, v) > limits.perItem) throw new Error('QUOTA_BYTES_PER_ITEM quota exceeded');
+        if (size(k, v) > limits.perItem) fail('QUOTA_BYTES_PER_ITEM quota exceeded');
       }
       const next = { ...mem, ...obj };
       let total = 0;
       for (const [k, v] of Object.entries(next)) total += size(k, v);
-      if (total > limits.total) throw new Error('QUOTA_BYTES quota exceeded');
-      if (Object.keys(next).length > limits.maxItems) throw new Error('MAX_ITEMS quota exceeded');
+      if (total > limits.total) fail('QUOTA_BYTES quota exceeded');
+      if (Object.keys(next).length > limits.maxItems) fail('MAX_ITEMS quota exceeded');
       Object.assign(mem, obj);
     },
-    remove: async (keys) => { for (const k of [].concat(keys)) delete mem[k]; },
+    remove: async (keys) => {
+      if (area.latency) await new Promise(r => setTimeout(r, area.latency));
+      for (const k of [].concat(keys)) delete mem[k];
+    },
     clear: async () => { for (const k of Object.keys(mem)) delete mem[k]; },
     getBytesInUse: async () => Object.entries(mem).reduce((n, [k, v]) => n + size(k, v), 0)
   };
+  return area;
 }
 const syncArea = makeArea({ perItem: 8192, total: 102400, maxItems: 512 });
 const localArea = makeArea({ perItem: Infinity, total: Infinity, maxItems: Infinity });
+const localAreaB = makeArea({ perItem: Infinity, total: Infinity, maxItems: Infinity });   // もう1台の PC
+/** 「もう1台の PC」で実行する（store.js は呼ばれるたびに chrome.storage.local を見る） */
+async function onPcB(fn) {
+  chrome.storage.local = localAreaB;
+  try { return await fn(); } finally { chrome.storage.local = localArea; }
+}
 let scriptingResult = null;   // collectPageMeta のテスト用
 /* 気になり帳への送信を試すための最小限のブラウザ側スタブ */
 const fakeBrowser = {
@@ -47,8 +63,10 @@ const fakeBrowser = {
   tabs: new Map(),
   nextTabId: 1,
   created: [],
+  attempts: 0,               // タブを開こうとした回数（失敗も数える）
+  onCreate: null,            // タブを開いた瞬間に割り込む処理（送信中の削除など）
   alarms: new Map(),
-  reset() { this.createFails = false; this.hasPermission = true; this.savedFlag = true; this.tabs.clear(); this.created = []; }
+  reset() { this.createFails = false; this.hasPermission = true; this.savedFlag = true; this.tabs.clear(); this.created = []; this.attempts = 0; this.onCreate = null; }
 };
 const sessionMem = {};
 globalThis.chrome = {
@@ -56,7 +74,11 @@ globalThis.chrome = {
   storage: {
     sync: syncArea, local: localArea,
     session: {
-      get: async (k) => (k in sessionMem ? { [k]: sessionMem[k] } : {}),
+      get: async (k) => {
+        const out = {};
+        for (const key of [].concat(k)) if (key in sessionMem) out[key] = sessionMem[key];
+        return out;
+      },
       set: async (o) => Object.assign(sessionMem, o),
       remove: async (k) => { for (const x of [].concat(k)) delete sessionMem[x]; }
     }
@@ -71,6 +93,8 @@ globalThis.chrome = {
   permissions: { contains: async () => fakeBrowser.hasPermission },
   tabs: {
     create: async ({ url }) => {
+      fakeBrowser.attempts++;
+      if (fakeBrowser.onCreate) await fakeBrowser.onCreate(url);
       if (fakeBrowser.createFails) throw new Error('タブを開けませんでした');
       const id = fakeBrowser.nextTabId++;
       fakeBrowser.tabs.set(id, url);
@@ -318,7 +342,8 @@ eq('失敗の理由が残る', q.entries[0].status, 'failed');
 eq('状態は「送信待ち」', KN.clipStateOf(stored, q.entries[0]).key, 'pending');
 
 // 何度も失敗すると自動での送り直しを止める
-for (let i = 0; i < KN.MAX_TRIES + 2; i++) await KN.flushClips();
+// （自動の再送は5分ごとのアラーム { retry: true } が担う。起き直しのたびには送らない — 下の回帰テスト）
+for (let i = 0; i < KN.MAX_TRIES + 2; i++) await KN.flushClips({ retry: true });
 q = await KN.queueSummary();
 ok('自動再送を止める', q.entries[0].tries >= KN.MAX_TRIES);
 eq('止めた分を数えられる', q.stuck, 1);
@@ -338,6 +363,49 @@ ok('送信済みの印が付く', stored.kn > 0);
 eq('確認できたので confirmed', stored.knc, 1);
 eq('状態は「送信済み」', KN.clipStateOf(stored, null).key, 'sent');
 ok('送った内容は最新の項目から作る', fakeBrowser.created[fakeBrowser.created.length - 1].includes('%E9%80%81%E4%BF%A1%E3%83%86%E3%82%B9%E3%83%88'));
+
+console.log('\n--- 回帰: 失敗した送信は間をあけて送り直す（Service Worker の起き直しごとに送らない） ---');
+// 以前は起き直すたび（タブの更新でも起きる）に送り直し、裏タブが何度も開いて5回の試行をすぐ使い切っていた
+fakeBrowser.reset();
+fakeBrowser.createFails = true;
+const gapItem = S.makeItem({ u: 'https://example.com/gap', t: '間をあける' }, knMeta);
+await S.putItems([gapItem]);
+await KN.enqueueClip(gapItem.id);
+await KN.flushClips({ force: true });
+eq('1回目の失敗', fakeBrowser.attempts, 1);
+await KN.flushClips();                         // 起き直したときの送り直し
+await KN.flushClips();
+eq('失敗したばかりの分は、起き直しても送らない', fakeBrowser.attempts, 1);
+await KN.flushClips({ retry: true });          // 5分ごとの再送アラーム
+eq('再送アラームでは送る', fakeBrowser.attempts, 2);
+await KN.flushClips({ force: true });          // 「今すぐ送る」
+eq('「今すぐ送る」では送る', fakeBrowser.attempts, 3);
+await chrome.storage.local.set({ [KN.QUEUE_KEY]: (await KN.getQueue()).map(e => ({ ...e, at: Date.now() - KN.RETRY_GAP_MS - 1000 })) });
+await KN.flushClips();
+eq('前回から間があいていれば、起き直したときにも送る', fakeBrowser.attempts, 4);
+const fresh1 = S.makeItem({ u: 'https://example.com/gap-new', t: '新しく保存' }, knMeta);
+await S.putItems([fresh1]);
+await KN.enqueueClip(fresh1.id);
+const before1 = fakeBrowser.attempts;
+await KN.flushClips();
+eq('新しく保存した分は待たずに送る（失敗中の分は待たせたまま）', fakeBrowser.attempts, before1 + 1);
+await KN.removeFromQueue(gapItem.id);
+await KN.removeFromQueue(fresh1.id);
+
+console.log('\n--- 回帰: 送っている間に消された項目は、送った印を控えておく ---');
+// 「元に戻す」で戻したときに印が無いと、もう一度送られて気になり帳に二重にできる
+fakeBrowser.reset();
+const goneItem = S.makeItem({ u: 'https://example.com/gone-while-sending', t: '送信中に削除' }, knMeta);
+await S.putItems([goneItem]);
+await KN.enqueueClip(goneItem.id);
+fakeBrowser.onCreate = async () => { fakeBrowser.onCreate = null; await S.removeItems([goneItem.id]); };
+flush = await KN.flushClips({ force: true });
+eq('送信は済んでいる', flush.sent, 1);
+eq('待ち行列からは外れる', (await KN.queueSummary()).entries.filter(e => e.id === goneItem.id).length, 0);
+const goneMark = await KN.takeSentWhileGone([goneItem.id]);
+ok('送った印が控えてある', goneMark[goneItem.id] && goneMark[goneItem.id].kn > 0 && goneMark[goneItem.id].knc === 1);
+eq('控えは一度だけ使う', await KN.takeSentWhileGone([goneItem.id]), {});
+eq('控えが無ければ空', await KN.takeSentWhileGone(['nothing']), {});
 
 // 保存の確認を許可していないときは「未確認」
 fakeBrowser.reset();
@@ -571,6 +639,38 @@ await S.wipeAll();
 delete syncArea._mem[S.WIPE_KEY];
 await S.replaceMeta(meta);
 
+console.log('\n--- 削除の取り消し（元に戻す） ---');
+const undoItem = S.makeItem({ u: 'https://undo.example/1', t: '元に戻す項目' }, meta);
+Object.assign(undoItem, { s: 1, rv: 3, b: 2, kn: 1, knc: 1 });
+const undoRich = { th: 'https://undo.example/th.jpg', si: 'サイト名' };
+await S.putItems([undoItem], { [undoItem.id]: undoRich });
+const undoSnap = structuredClone((await S.getAll()).items.find(i => i.id === undoItem.id));
+await S.removeItems([undoItem.id]);
+ok('削除の記録が付く', (syncArea._mem.del || []).some(d => d.i === undoItem.id));
+eq('削除すると消える', (await S.getAll()).items.filter(i => i.id === undoItem.id).length, 0);
+await new Promise(r => setTimeout(r, 5));   // 削除と取り消しが同じミリ秒にならないように
+const undoRes = await S.restoreItems([undoSnap], { [undoItem.id]: undoRich });
+ok('元に戻せる', undoRes.ok);
+const undoAll = await S.getAll();
+const undoBack = undoAll.items.find(i => i.id === undoItem.id);
+ok('一覧に戻る', !!undoBack);
+eq('復習の進み具合・気になり帳の印も元どおり', [undoBack.s, undoBack.rv, undoBack.b, undoBack.kn, undoBack.knc], [1, 3, 2, 1, 1]);
+eq('サムネイル等も戻る', undoAll.rich[undoItem.id], undoRich);
+ok('削除の記録は外れる', !(syncArea._mem.del || []).some(d => d.i === undoItem.id));
+ok('同期にも載り直す', !!syncArea._mem['i:' + undoItem.id]);
+ok('更新時刻が新しくなる', undoBack.up > undoSnap.up);
+ok('渡した控えは書き換えない', undoSnap.up < undoBack.up);
+// 他の PC: 削除の記録を先に受け取って消したあとで、戻した項目が届いた場合
+delete localArea._mem['L:' + undoItem.id];
+delete localArea._mem['R:' + undoItem.id];
+syncArea._mem.del = [...(syncArea._mem.del || []), { i: undoItem.id, t: undoSnap.up + 1 }];
+const other = await S.getAll();
+ok('他の PC で消えた分も、戻した方が新しいので取り込まれる', other.items.some(i => i.id === undoItem.id));
+eq('空の取り消しは何もしない', (await S.restoreItems([])).count, 0);
+await S.wipeAll();
+delete syncArea._mem[S.WIPE_KEY];
+await S.replaceMeta(meta);
+
 console.log('\n--- 回帰: ドメインの記憶が増え続けない ---');
 let domRes = null;
 for (let i = 0; i < 80; i++) domRes = await S.setMeta({ dom: { ['d' + i + '.example']: 'c0' } });
@@ -643,6 +743,198 @@ const huge = { ...jp, id: 'huge', n: 'あ'.repeat(4000) };
 const hres = await S.putItems([huge]);
 ok('大きすぎる項目は保存前に弾く', hres.ok === false && /長すぎます/.test(hres.error));
 ok('同期容量エラーの文言', S.describeQuotaError(new Error('QUOTA_BYTES quota exceeded')).includes('端末内'));
+
+/* ---------- 1.8.1 の回帰テスト: 削除の記録 ---------- */
+const resetAll = async (m = meta) => {
+  await S.wipeAll();
+  delete syncArea._mem[S.WIPE_KEY];
+  for (const k of Object.keys(localAreaB._mem)) delete localAreaB._mem[k];
+  syncArea.errors.length = 0;
+  await S.replaceMeta(structuredClone(m));
+};
+const tombIds = () => [...S.readTombs(syncArea._mem).keys()];
+const syncBytes = () => Object.entries(syncArea._mem).reduce((n, [k, v]) => n + new TextEncoder().encode(k + JSON.stringify(v)).length, 0);
+const tombKeySizes = () => Object.entries(syncArea._mem)
+  .filter(([k]) => k === S.DEL_KEY || S.isTombShardKey(k))
+  .map(([k, v]) => new TextEncoder().encode(k + JSON.stringify(v)).length);
+/** PC A で保存したものを、PC B が少しずつ取り込んでいく（同期に載るのは新しい分だけなので） */
+async function putOnBothPcs(list, chunk = 50) {
+  for (let i = 0; i < list.length; i += chunk) {
+    await S.putItems(list.slice(i, i + chunk));
+    await onPcB(() => S.getAll());
+  }
+}
+
+console.log('\n--- 回帰: 一度にたくさん消しても削除の記録を落とさない ---');
+// 以前は記録を 120 件で切っていたので、まとめて消すと残りが他の PC から戻ってきた
+await resetAll();
+const many500 = Array.from({ length: 500 }, (_, i) => S.makeItem({ u: `https://bulk.example/${i}`, t: `まとめて ${i}` }, meta));
+await putOnBothPcs(many500);
+eq('PC B にも 500 件ある', (await onPcB(() => S.getAll())).items.length, 500);
+await S.removeItems(many500.map(i => i.id));
+eq('同期の書き込みエラーは出ていない', syncArea.errors, []);
+eq('500 件すべての記録が残る', many500.filter(i => tombIds().includes(i.id)).length, 500);
+ok('記録は複数のキーに分けて持つ', Object.keys(syncArea._mem).filter(k => S.isTombShardKey(k)).length >= 2);
+ok('どのキーも 1キー 8192 バイト未満', tombKeySizes().every(n => n < 8192));
+ok('旧バージョン向けの del は新しい 120 件まで', Array.isArray(syncArea._mem.del) && syncArea._mem.del.length === S.DEL_MAX);
+ok('同期全体も上限内', syncBytes() <= S.SYNC_QUOTA_BYTES && Object.keys(syncArea._mem).length <= S.SYNC_MAX_ITEMS);
+eq('PC B でも全部消える', (await onPcB(() => S.getAll())).items.length, 0);
+const onB = S.makeItem({ u: 'https://bulk.example/new-on-b', t: 'PC B で保存' }, meta);
+await onPcB(() => S.putItems([onB]));
+eq('回帰: PC B が何か保存しても、消した項目は戻ってこない', (await S.getAll()).items.map(i => i.id), [onB.id]);
+
+console.log('\n--- 回帰: 同期がいっぱいでも削除の記録を書ける ---');
+await resetAll();
+const oldOnes = Array.from({ length: 600 }, (_, i) => S.makeItem({ u: `https://old.example/${i}`, t: `古い項目 ${i}` }, meta));
+await putOnBothPcs(oldOnes, 60);
+const newOnes = Array.from({ length: 260 }, (_, i) => S.makeItem({ u: `https://new.example/${i}`, t: `新しい項目 ${i}`, n: 'メモ'.repeat(30) }, meta));
+await putOnBothPcs(newOnes, 65);
+ok(`同期に新しい項目が上限近くまで載っている（${syncBytes()} バイト）`, syncBytes() > 80000);
+ok('古い項目は同期に載っていない', !Object.keys(syncArea._mem).some(k => k === 'i:' + oldOnes[0].id));
+await S.removeItems(oldOnes.map(i => i.id));     // 同期に載っていない 600 件を消す
+eq('同期の書き込みエラーは出ていない', syncArea.errors, []);
+eq('600 件すべての記録が残る', oldOnes.filter(i => tombIds().includes(i.id)).length, 600);
+ok('同期全体は上限内', syncBytes() <= S.SYNC_QUOTA_BYTES);
+const bAfterFull = await onPcB(() => S.getAll());
+eq('PC B からも消える', bAfterFull.items.filter(i => i.u.startsWith('https://old.example/')).length, 0);
+eq('同期から降ろした新しい項目も、どちらの PC にも残る', [
+  (await S.getAll()).items.filter(i => i.u.startsWith('https://new.example/')).length,
+  bAfterFull.items.filter(i => i.u.startsWith('https://new.example/')).length
+], [260, 260]);
+await S.syncPush();
+ok('載せ直しても上限を超えない', syncBytes() <= S.SYNC_QUOTA_BYTES && !syncArea.errors.length);
+
+console.log('\n--- 回帰: 削除の記録の形と期限 ---');
+const DAYMS = 86400000;
+const now0 = Date.now();
+const tomb = new Map([['keep-1', now0], ['recent', now0 - DAYMS], ['expired', now0 - 61 * DAYMS]]);
+const enc = S.encodeTombs(tomb, new Set(['keep-1']), now0);
+const back = S.readTombs(enc.keys);
+ok('60日を過ぎた記録は捨てる', !back.has('expired'));
+eq('期限内の記録は残る（時刻もそのまま）', [back.get('keep-1'), back.get('recent')], [now0, now0 - DAYMS]);
+ok('旧形式の del にも写す', enc.keys.del.some(d => d.i === 'recent' && d.t === now0 - DAYMS));
+// 入りきらないほど記録があっても、今回の分は必ず残し、古いものから捨てる
+const bigTombs = new Map();
+for (let i = 0; i < 4000; i++) bigTombs.set('old-' + i, now0 - DAYMS - i * 1000);
+const batch = new Set();
+for (let i = 0; i < 500; i++) { bigTombs.set('batch-' + i, now0); batch.add('batch-' + i); }
+const encBig = S.encodeTombs(bigTombs, batch, now0);
+const backBig = S.readTombs(encBig.keys);
+ok('今回の 500 件は必ず残る', [...batch].every(id => backBig.has(id)));
+ok(`入りきらない古い記録は捨てる（残り ${backBig.size} 件）`, backBig.size < 4500 && encBig.dropped > 0);
+ok('捨てるのは古いものから', backBig.has('old-0') && !backBig.has('old-3999'));
+ok('キーの数は上限まで', Object.keys(encBig.keys).filter(k => S.isTombShardKey(k)).length <= S.TOMB_SHARDS);
+ok('どのキーも 8192 バイト未満',
+  Object.entries(encBig.keys).every(([k, v]) => new TextEncoder().encode(k + JSON.stringify(v)).length < 8192));
+eq('"__proto__" のような id でも記録が残る', S.readTombs(S.encodeTombs(new Map([['__proto__', now0]]), new Set(), now0).keys).get('__proto__'), now0);
+
+console.log('\n--- 回帰: 旧バージョンの端末と混在しても記録が消えない ---');
+await resetAll();
+const mixA = S.makeItem({ u: 'https://mix.example/a', t: '新しい版で削除' }, meta);
+const mixB = S.makeItem({ u: 'https://mix.example/b', t: '旧版で削除' }, meta);
+await putOnBothPcs([mixA, mixB]);
+await S.removeItems([mixA.id]);
+// 旧バージョン（1.8.0）の端末が自分の削除を del に書く: 読んで → 足して → 120件に切って書く
+const oldDel = (syncArea._mem.del || []).filter(d => d.i !== mixA.id);   // たまたま古い内容を読んでいた
+syncArea._mem.del = [...oldDel, { i: mixB.id, t: Date.now() }];
+delete syncArea._mem['i:' + mixB.id];
+const mixOnB = await onPcB(() => S.getAll());
+eq('新しい版の記録（del1..）も旧版の記録（del）も効く', mixOnB.items.length, 0);
+await S.removeItems(['someone-else']);        // 新しい版が次に書くとき、旧版の記録も取り込む
+ok('旧版の記録を分割キーへ引き継ぐ', Object.keys(syncArea._mem).filter(k => S.isTombShardKey(k))
+  .some(k => mixB.id in syncArea._mem[k]));
+// 旧形式（del だけ）しか無い同期も読める
+await resetAll();
+const legacyOnly = S.makeItem({ u: 'https://legacy.example/x', t: '旧形式で削除済み' }, meta);
+await putOnBothPcs([legacyOnly]);
+syncArea._mem.del = [{ i: legacyOnly.id, t: Date.now() + 10 }];
+delete syncArea._mem['i:' + legacyOnly.id];
+eq('旧形式の記録だけでも削除が伝わる', (await onPcB(() => S.getAll())).items.length, 0);
+
+console.log('\n--- 回帰: 数値の id でも削除が伝わる ---');
+await resetAll();
+const numItem = S.makeItem({ id: 4242, url: 'https://num.example/1', title: '数値ID' }, meta);
+await putOnBothPcs([numItem]);
+await S.removeItems([4242]);
+ok('旧形式の del には数値のまま写す', (syncArea._mem.del || []).some(d => d.i === 4242));
+eq('PC B でも消える', (await onPcB(() => S.getAll())).items.length, 0);
+
+console.log('\n--- 回帰: 削除の記録の読み書きが重ならない ---');
+// 以前は2つの削除が重なると、あとから書いた方が先の記録を消していた（消した項目が他の PC から戻る）
+await resetAll();
+const raceA = S.makeItem({ u: 'https://race.example/a', t: '先に消す' }, meta);
+const raceB = S.makeItem({ u: 'https://race.example/b', t: 'すぐあとに消す' }, meta);
+await putOnBothPcs([raceA, raceB]);
+syncArea.latency = 15;
+await Promise.all([S.removeItems([raceA.id]), new Promise(r => setTimeout(r, 5)).then(() => S.removeItems([raceB.id]))]);
+syncArea.latency = 0;
+ok('同じ画面で続けて消しても、両方の記録が残る', tombIds().includes(raceA.id) && tombIds().includes(raceB.id));
+const restoreRace = S.makeItem({ u: 'https://race.example/c', t: '戻しながら消す' }, meta);
+await S.putItems([restoreRace]);
+const snapC = { ...(await S.getAll()).items.find(i => i.id === restoreRace.id) };
+await S.removeItems([restoreRace.id]);
+await new Promise(r => setTimeout(r, 5));
+syncArea.latency = 15;
+const raceD = S.makeItem({ u: 'https://race.example/d', t: '戻している間に消す' }, meta);
+await S.putItems([raceD]);
+await Promise.all([S.restoreItems([snapC]), new Promise(r => setTimeout(r, 5)).then(() => S.removeItems([raceD.id]))]);
+syncArea.latency = 0;
+ok('戻している間に消しても、消した方の記録は残る', tombIds().includes(raceD.id) && !tombIds().includes(restoreRace.id));
+
+// 別のタブや Service Worker（＝別のモジュール）とも重ならない: Web Locks で並べる
+const S2 = await import(pathToFileURL(path.join(ROOT, 'store.js')).href + '?another-tab');
+const navDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+async function crossTabRace(withLocks) {
+  await resetAll();
+  const x = S.makeItem({ u: 'https://tabs.example/x', t: 'タブ1で消す' }, meta);
+  const y = S.makeItem({ u: 'https://tabs.example/y', t: 'タブ2で消す' }, meta);
+  await S.putItems([x, y]);
+  const tails = new Map();
+  const locks = { calls: 0, request(name, cb) {
+    this.calls++;
+    const run = (tails.get(name) || Promise.resolve()).then(() => cb({ name }));
+    tails.set(name, run.then(() => {}, () => {}));
+    return run;
+  } };
+  Object.defineProperty(globalThis, 'navigator', { value: withLocks ? { locks } : {}, configurable: true, writable: true });
+  syncArea.latency = 15;
+  try { await Promise.all([S.removeItems([x.id]), S2.removeItems([y.id])]); }
+  finally { syncArea.latency = 0; Object.defineProperty(globalThis, 'navigator', navDesc); }
+  return { both: tombIds().includes(x.id) && tombIds().includes(y.id), calls: locks.calls };
+}
+const noLock = await crossTabRace(false);
+ok('（確認）ロックが無いと別のタブ同士では記録を取り合う', !noLock.both);
+const withLock = await crossTabRace(true);
+ok('Web Locks があれば別のタブ同士でも両方の記録が残る', withLock.both && withLock.calls >= 2);
+
+console.log('\n--- 回帰: 同期オフのときは削除を他の PC へ伝えない ---');
+await resetAll();
+const shared = S.makeItem({ u: 'https://shared.example/1', t: '両方の PC にある' }, meta);
+await putOnBothPcs([shared]);
+await S.replaceMeta({ ...structuredClone(meta), s: { ...meta.s, sync: false } });
+await S.removeItems([shared.id]);
+ok('記録を残さない', !tombIds().includes(shared.id));
+eq('PC B の同じ項目は消えない（「この端末のみ」）', (await onPcB(() => S.getAll())).items.map(i => i.id), [shared.id]);
+eq('こちらでは消えている', (await S.getAll()).items.length, 0);
+
+console.log('\n--- 回帰: 元に戻すと、分割した記録からも外れる ---');
+await resetAll();
+const undoX = S.makeItem({ u: 'https://undo2.example/x', t: '戻す項目' }, meta);
+await putOnBothPcs([undoX]);
+const undoXSnap = { ...(await S.getAll()).items.find(i => i.id === undoX.id) };
+await S.removeItems([undoX.id]);
+ok('消すと記録が付く', tombIds().includes(undoX.id));
+await new Promise(r => setTimeout(r, 5));
+await S.restoreItems([undoXSnap]);
+ok('戻すと記録が外れる（分割キー・旧形式とも）', !tombIds().includes(undoX.id) && !(syncArea._mem.del || []).some(d => d.i === undoX.id));
+eq('PC B にも戻る', (await onPcB(() => S.getAll())).items.map(i => i.id), [undoX.id]);
+await resetAll();
+
+console.log('\n--- 回帰: CSV に書き出す値 ---');
+eq('= で始まる値は数式にならないようにする', S.csvCell('=HYPERLINK("http://evil/")'), `"'=HYPERLINK(""http://evil/"")"`);
+eq('+ - @ も同じ', ['+1', '-1', '@SUM(A1)'].map(S.csvCell), [`"'+1"`, `"'-1"`, `"'@SUM(A1)"`]);
+eq('タブ・CR で始まる値も同じ', ['\tx', '\rx'].map(S.csvCell), ['"\'\tx"', '"\'\rx"']);
+eq('ふつうの値はそのまま', [S.csvCell('React 入門'), S.csvCell(3), S.csvCell(null)], ['"React 入門"', '"3"', '""']);
 
 console.log('\n--- エラーメッセージ ---');
 ok('同期容量の文言', S.describeQuotaError(new Error('QUOTA_BYTES quota exceeded')).includes('100KB'));

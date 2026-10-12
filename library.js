@@ -2,14 +2,14 @@
    Recall — ライブラリ画面
    ============================================================ */
 import {
-  getAll, putItems, removeItems, replaceMeta, makeItem, review, resume, isDue, usage,
+  getAll, putItems, removeItems, restoreItems, replaceMeta, makeItem, review, resume, isDue, usage,
   domainOf, faviconUrl, fmtDate, tagCounts, matches, normalizeTags, clip, wipeAll,
-  thumbOf, youtubeId, fmtDuration, syncPush,
+  thumbOf, youtubeId, fmtDuration, syncPush, isSavableUrl, csvCell, startOfToday,
   STATUS, STATUS_LABEL, PRESET_INTERVALS, CAT_COLORS, DEFAULT_STEPS, DEFAULT_META,
   newId, LIMITS
 } from './store.js';
 import { CHANGELOG, currentVersion, entryFor } from './changelog.js';
-import { KN_CATEGORIES, originOf, clipEnabled, MAX_TRIES } from './kininari.js';
+import { KN_CATEGORIES, originOf, clipEnabled, MAX_TRIES, getQueue, takeSentWhileGone } from './kininari.js';
 
 const $ = (id) => document.getElementById(id);
 let items = [], meta = null, rich = {};
@@ -17,6 +17,10 @@ let view = 'all', activeTag = null, query = '', sort = 'new';
 let selMode = false, selection = new Set();
 let focusQueue = [], focusIdx = 0;
 let muteReload = false;
+// 二度押し対策。保存・削除の最中と、ダブルクリックの2回目は受け付けない
+// （1回目で一覧が詰まると、2回目が「見ていない次のカード」に当たってしまう）
+let deleting = false, cardBusy = false, focusBusy = false, focusShownAt = 0;
+const FOCUS_MIN_MS = 350;   // 集中復習でカードを出してから、これより早い入力は「見る前の連打」として捨てる
 
 const ICONS = {
   bell: 'M12 2a6 6 0 00-6 6v3.7l-1.6 3a1 1 0 00.9 1.5h13.4a1 1 0 00.9-1.5l-1.6-3V8a6 6 0 00-6-6zm0 20a2.6 2.6 0 002.6-2.5H9.4A2.6 2.6 0 0012 22z',
@@ -280,14 +284,18 @@ function card(it) {
   acts.appendChild(star);
 
   if (it.s === STATUS.NEW || it.s === STATUS.LEARNING) {
-    acts.appendChild(btn('覚えた', 'btn sm', async () => { await save([review(it, 'ok', meta)]); }));
-    acts.appendChild(btn('まだ', 'btn sm ghost', async () => { await save([review(it, 'again', meta)]); }));
+    acts.appendChild(btn('覚えた', 'btn sm', cardAction(() => save([review(it, 'ok', meta)]))));
+    acts.appendChild(btn('まだ', 'btn sm ghost', cardAction(() => save([review(it, 'again', meta)]))));
   } else if (it.s === STATUS.DONE) {
-    acts.appendChild(btn('再開', 'btn sm ghost', async () => { await save([resume(it, meta, 0)]); }));
+    acts.appendChild(btn('再開', 'btn sm ghost', cardAction(() => save([resume(it, meta, 0)]))));
   } else {
-    acts.appendChild(btn('戻す', 'btn sm ghost', async () => { await save([resume(it, meta, 0)]); }));
+    acts.appendChild(btn('戻す', 'btn sm ghost', cardAction(() => save([resume(it, meta, 0)]))));
   }
   acts.appendChild(btn('編集', 'btn sm ghost', () => openEdit(it)));
+  // ダブルクリックの2回目は無視する（1回目で一覧が詰まり、次のカードの削除ボタンが指の下に来る）
+  const del = btn('削除', 'btn sm ghost del', (e) => { if (!isRepeatClick(e)) deleteItems([it]); });
+  del.title = '削除（直後なら「元に戻す」で戻せます）';
+  acts.appendChild(del);
   el.appendChild(acts);
   return el;
 }
@@ -350,6 +358,22 @@ function pill(text, color) {
 function txt(t) { const s = document.createElement('span'); s.textContent = t; return s; }
 function btn(label, cls, fn) { const b = document.createElement('button'); b.className = cls; b.textContent = label; b.onclick = fn; return b; }
 
+/** ダブルクリックの2回目か（detail はブラウザが数える連続クリックの回数） */
+const isRepeatClick = (e) => !!(e && e.detail > 1);
+
+/**
+ * カードの「覚えた」「まだ」「再開」「戻す」。保存中の連打とダブルクリックの2回目は受け付けない。
+ * 今日の復習では答えたカードが消えて次が詰まってくるので、2回目が見ていないカードに当たる。
+ * ほかの画面でも、描き直した同じカードに当たって二重に記録してしまう。
+ */
+function cardAction(fn) {
+  return async (e) => {
+    if (cardBusy || deleting || isRepeatClick(e)) return;
+    cardBusy = true;
+    try { await fn(); } finally { cardBusy = false; }
+  };
+}
+
 async function renderUsage() {
   const u = await usage();
   const pct = Math.min(100, Math.round(u.pct * 100));
@@ -396,11 +420,92 @@ async function removeMany(ids) {
   let res;
   try { muteReload = true; res = await removeItems(ids); }
   finally { muteReload = false; }                       // 失敗しても購読を止めたままにしない
-  if (!res || !res.ok) { alert((res && res.error) || '削除に失敗しました'); return; }
+  if (!res || !res.ok) { alert((res && res.error) || '削除に失敗しました'); return false; }
   items = items.filter(i => !ids.includes(i.id));
-  selection.clear();
+  for (const id of ids) { selection.delete(id); delete rich[id]; }
   chrome.runtime.sendMessage({ type: 'refresh' });
   render();
+  return true;
+}
+
+/**
+ * 削除して「元に戻す」を出す。
+ * 消したものは控えておき、押されたらそのまま保存し直す
+ * （サムネイル・復習の進み具合・気になり帳に送った印まで元どおり）。
+ * 「元に戻す」が出ているあいだに続けて消したものは、同じまとまりに足して一緒に戻す
+ * （2つ目を消した時点で1つ目が戻せなくなると、取り返しがつかないため）。
+ */
+async function deleteItems(list) {
+  if (deleting) return false;                        // 消している最中の二度押しは無視する
+  list = (list || []).filter(Boolean);
+  if (!list.length) return false;
+  deleting = true;
+  try {
+    const snap = list.map(i => ({ ...i }));
+    const richSnap = {};
+    for (const i of snap) if (rich[i.id]) richSnap[i.id] = { ...rich[i.id] };
+    // 気になり帳へ送る順番待ちだったものは、戻したときに並び直す
+    //（消している間に待ち行列から外されると、戻しても二度と送られない）
+    let queued = [];
+    try { const q = await getQueue(); queued = snap.filter(i => q.some(e => e.id === i.id)).map(i => i.id); }
+    catch { queued = []; }
+    if (!(await removeMany(snap.map(i => i.id)))) return false;
+    const g = (undoFn && undoGroup) ? undoGroup : { items: [], rich: {}, queued: [] };
+    for (const s of snap) if (!g.items.some(x => x.id === s.id)) g.items.push(s);
+    Object.assign(g.rich, richSnap);
+    g.queued.push(...queued);
+    undoGroup = g;
+    const n = g.items.length;
+    const what = n === 1 ? `「${clip(g.items[0].t, 28)}」を削除しました` : `${n} 件を削除しました`;
+    // 送った印は「確認できた（knc）」ものだけでなく、未確認（kn のみ）でも気になり帳に届いている
+    const kn = g.items.some(i => i.kn || i.knc) ? '（気になり帳に送った分は、気になり帳に残ります）' : '';
+    showToast(what + kn, () => restoreGroup(g));
+    return true;
+  } finally { deleting = false; }
+}
+
+/** まとめて元に戻す */
+async function restoreGroup(g) {
+  const gen = toastGen;
+  const ids = g.items.map(i => i.id);
+  // 消している間に気になり帳へ送り終えていた分は、送った印ごと戻す（もう一度送ると二重になる）
+  const sent = await takeSentWhileGone(ids);
+  const list = g.items.map(i => (sent[i.id] ? { ...i, ...sent[i.id] } : i));
+  let res;
+  try { muteReload = true; res = await restoreItems(list, Object.keys(g.rich).length ? g.rich : undefined); }
+  finally { muteReload = false; }
+  if (!res || !res.ok) { alert((res && res.error) || '元に戻せませんでした'); return; }
+  const requeue = [...new Set(g.queued)].filter(id => !sent[id]);
+  if (requeue.length) chrome.runtime.sendMessage({ type: 'clipRequeue', ids: requeue });
+  ({ items, meta, rich } = await getAll());
+  chrome.runtime.sendMessage({ type: 'refresh' });
+  render();
+  // 戻している間に別の削除で「元に戻す」が出ていたら、それを上書きしない
+  if (toastGen === gen) showToast(ids.length === 1 ? '元に戻しました' : `${ids.length} 件を元に戻しました`);
+}
+
+/* ---------- お知らせ ---------- */
+
+let toastT = 0, undoFn = null, undoGroup = null, toastGen = 0;
+/** undo を渡すと「元に戻す」が付き、少し長めに出す */
+function showToast(msg, undo) {
+  toastGen++;                        // 出し直すたびに数える（古い処理が新しいお知らせを消さないように）
+  undoFn = undo || null;
+  if (!undoFn) undoGroup = null;     // 「元に戻す」が消えたら、まとまりも終わり
+  $('toastMsg').textContent = msg;
+  $('toastUndo').classList.toggle('hidden', !undoFn);
+  $('toast').classList.remove('hidden');
+  clearTimeout(toastT);
+  toastT = setTimeout(hideToast, undoFn ? 10000 : 3000);
+}
+function hideToast() {
+  clearTimeout(toastT); toastT = 0; undoFn = null; undoGroup = null;
+  $('toast').classList.add('hidden');
+}
+async function undoLast() {
+  const f = undoFn;
+  hideToast();
+  if (f) await f();
 }
 
 /* ---------- 一括操作 ---------- */
@@ -500,18 +605,42 @@ function showFocus() {
   $('fNote').textContent = it.n || '';
   const tg = $('fTags'); tg.innerHTML = '';
   for (const t of it.g || []) { const c = document.createElement('span'); c.className = 'chip'; c.textContent = '#' + t; tg.appendChild(c); }
-  const steps = meta.s.steps;
-  const okDays = it.iv > 0 ? it.iv : (steps[Math.min((it.b || 0) + 1, steps.length - 1)]);
-  const isLast = it.iv === 0 && (it.b || 0) + 1 >= steps.length;
-  $('fOkSub').textContent = isLast ? '完了にする' : `次は${okDays}日後`;
-  $('fAgainSub').textContent = it.iv > 0 ? `${Math.max(1, Math.round(it.iv / 3))}日後` : `${steps[0]}日後`;
+  // 日数は実際に入る予定から出す（「まだ」で1段階だけ戻す設定や固定間隔でも、表示と結果がずれない）
+  const ok = review(it, 'ok', meta), again = review(it, 'again', meta);
+  $('fOkSub').textContent = ok.s === STATUS.DONE ? '完了にする' : `次は${daysFromToday(ok.d)}日後`;
+  $('fAgainSub').textContent = `${daysFromToday(again.d)}日後`;
+  focusShownAt = Date.now();
 }
 
-async function focusAnswer(result) {
-  const it = items.find(i => i.id === focusQueue[focusIdx]);
-  if (it) await save([review(it, result, meta)]);
+function daysFromToday(ts) {
+  return Math.round((new Date(ts).setHours(0, 0, 0, 0) - startOfToday()) / 86400000);
+}
+
+/**
+ * 集中復習の操作は1つずつ受け付ける。保存・削除の最中、ダブルクリックの2回目、
+ * カードを出した直後（FOCUS_MIN_MS 未満）の入力は捨てる。
+ * 連打で同じ項目を二重に記録したり、見ていない次のカードに答えたり消したりしないように。
+ */
+async function focusGuard(e, fn) {
+  if (focusBusy || deleting || isRepeatClick(e) || Date.now() - focusShownAt < FOCUS_MIN_MS) return;
+  focusBusy = true;
+  try { await fn(); } finally { focusBusy = false; }
+}
+
+/** いま出ているカードが id のままなら次へ進む（割り込みがあっても2枚進めない） */
+function focusNext(id) {
+  if (focusQueue[focusIdx] !== id) return;
   focusIdx++;
   if (focusIdx >= focusQueue.length) endFocus(); else showFocus();
+}
+
+function focusAnswer(result, e) {
+  return focusGuard(e, async () => {
+    const id = focusQueue[focusIdx];
+    const it = items.find(i => i.id === id);
+    if (it) await save([review(it, result, meta)]);
+    focusNext(id);
+  });
 }
 
 /* ---------- バージョン情報と更新履歴 ---------- */
@@ -680,20 +809,26 @@ async function renderKnQueue() {
 function renderCatEditor() {
   const box = $('catEditor'); box.innerHTML = '';
   meta.cats.forEach((c, idx) => {
+    const cid = c.id;
+    // 操作のたびに、いまの meta から id で引き直す。開いている間に他の変更で meta が読み直されると、
+    // 描いたときのオブジェクトを書き換えても保存されず、名前や色の変更が黙って消えるため
+    const curCat = () => meta.cats.find(x => x.id === cid);
     const row = document.createElement('div'); row.className = 'caterow';
     const color = document.createElement('input'); color.type = 'color'; color.value = c.color;
     const name = document.createElement('input'); name.type = 'text'; name.value = c.name; name.maxLength = 20;
-    const n = items.filter(i => i.c === c.id).length;
+    const n = items.filter(i => i.c === cid).length;
     const cnt = document.createElement('span'); cnt.className = 'faint'; cnt.style.fontSize = '11.5px'; cnt.textContent = `${n}件`;
     const del = document.createElement('button'); del.type = 'button'; del.className = 'btn sm danger'; del.textContent = '削除';
     del.disabled = idx === 0;
-    color.onchange = async () => { c.color = color.value; await saveMeta(); };
-    name.onchange = async () => { c.name = clip(name.value, 20) || c.name; await saveMeta(); renderCatEditor(); };
+    color.onchange = async () => { const x = curCat(); if (!x) return; x.color = color.value; await saveMeta(); };
+    name.onchange = async () => { const x = curCat(); if (!x) return; x.name = clip(name.value, 20) || x.name; await saveMeta(); renderCatEditor(); };
     del.onclick = async () => {
-      if (!confirm(`「${c.name}」を削除します。${n}件は「${meta.cats[0].name}」に移動します。`)) return;
-      const moved = items.filter(i => i.c === c.id).map(i => ({ ...i, c: meta.cats[0].id }));
-      meta.cats = meta.cats.filter(x => x.id !== c.id);
-      if (meta.s.defaultCat === c.id) meta.s.defaultCat = meta.cats[0].id;
+      const x = curCat(); if (!x) return;
+      const count = items.filter(i => i.c === cid).length;
+      if (!confirm(`「${x.name}」を削除します。${count}件は「${meta.cats[0].name}」に移動します。`)) return;
+      const moved = items.filter(i => i.c === cid).map(i => ({ ...i, c: meta.cats[0].id }));
+      meta.cats = meta.cats.filter(y => y.id !== cid);
+      if (meta.s.defaultCat === cid) meta.s.defaultCat = meta.cats[0].id;
       await saveMeta();
       if (moved.length) await save(moved);
       renderCatEditor(); fillCatSelect($('sCat'), meta.s.defaultCat); render();
@@ -736,7 +871,7 @@ function exportJson() {
 }
 
 function exportCsv() {
-  const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+  const esc = csvCell;     // = + - @ で始まる値は数式として実行されないようにする
   const head = ['タイトル', 'URL', 'カテゴリ', 'タグ', 'メモ', 'サイト/チャンネル', '状態', '次回復習', '復習回数', '保存日'];
   const rows = items.map(i => [
     i.t, i.u, catById(i.c).name, (i.g || []).join(' '), i.n,
@@ -780,9 +915,14 @@ async function importJson(file) {
     const add = [];
     const addRich = {};
     const incomingRich = (data.rich && typeof data.rich === 'object') ? data.rich : {};
+    let invalid = 0;
     for (const raw of incoming) {
+      // http/https で始まらないもの（URL が無い・javascript: など）は読み込まない。
+      // URL が無いと一覧に出ないのに件数にだけ数えられ、消すこともできなくなる
+      if (!raw || typeof raw !== 'object') { invalid++; continue; }
       const oldId = raw.id;
       const it = makeItem(raw, meta);
+      if (!isSavableUrl(it.u)) { invalid++; continue; }
       while (have.has(it.id)) it.id = newId();   // 取り込み中に採番した ID も衝突判定に含める
       have.add(it.id);
       add.push(it);
@@ -803,9 +943,10 @@ async function importJson(file) {
     } finally { muteReload = false; }
     ({ items, meta, rich } = await getAll());
     render();
+    const skipNote = invalid ? `（URL が http:// / https:// でない ${invalid} 件は読み込みませんでした）` : '';
     $('setMsg').textContent = (failure
       ? `${done} 件まで読み込んだところで中断しました: ${failure}`
-      : `${done} 件を読み込みました。`) + importNote;
+      : (done ? `${done} 件を読み込みました。` : '読み込める項目がありませんでした。')) + skipNote + importNote;
   } catch (e) {
     $('setMsg').textContent = '読み込みに失敗しました: ' + e.message;
   }
@@ -856,39 +997,73 @@ function bind() {
   };
   $('bulkDone').onclick = async () => save(selectedItems().map(i => ({ ...i, s: STATUS.DONE, d: 0 })));
   $('bulkArchive').onclick = async () => save(selectedItems().map(i => ({ ...i, s: STATUS.ARCHIVED, d: 0 })));
-  $('bulkDel').onclick = async () => {
-    if (!selection.size) return;
+  $('bulkDel').onclick = async (e) => {
+    if (deleting || isRepeatClick(e) || !selection.size) return;   // 消している最中の二度押しは無視
     const names = selectedItems().slice(0, 5).map(i => '・' + clip(i.t, 40)).join('\n');
     const more = selection.size > 5 ? `\n…ほか ${selection.size - 5} 件` : '';
-    if (!confirm(`${selection.size} 件を削除します。元に戻せません。\n\n${names}${more}`)) return;
-    await removeMany([...selection]);
+    if (!confirm(`${selection.size} 件を削除します。（直後なら「元に戻す」で戻せます）\n\n${names}${more}`)) return;
+    await deleteItems(selectedItems());
   };
 
   // 編集ダイアログ
   $('editDlg').addEventListener('close', async () => {
     if ($('editDlg').returnValue !== 'save' || !editing) { editing = null; return; }
-    const it = { ...editing };
-    it.t = clip($('eTitle').value, LIMITS.title) || it.u;
-    it.u = clip($('eUrl').value, LIMITS.url) || it.u;
-    it.n = clip($('eNote').value, LIMITS.note);
-    it.c = $('eCat').value;
-    it.g = normalizeTags($('eTags').value);
-    it.iv = Number($('eIv').value);
-    it.s = Number($('eStatus').value);
-    if ($('eDue').value) {
-      const d = new Date($('eDue').value + 'T00:00:00');
+    const base = editing;                            // 開いたときの内容
+    editing = null;
+    // フォームは先に読む（このあと待つ間に別の項目の編集を開かれても混ざらないように）
+    const form = {
+      t: clip($('eTitle').value, LIMITS.title) || base.u,
+      u: clip($('eUrl').value, LIMITS.url) || base.u,
+      n: clip($('eNote').value, LIMITS.note),
+      c: $('eCat').value,
+      g: normalizeTags($('eTags').value),
+      iv: Number($('eIv').value),
+      s: Number($('eStatus').value)
+    };
+    const was = { t: base.t, u: base.u, n: base.n || '', c: base.c, g: base.g || [], iv: base.iv || 0, s: base.s };
+    const due = $('eDue').value;
+    const dueTouched = due !== (base.d ? toDateInput(base.d) : '');
+    const wasFocus = !$('focus').classList.contains('hidden');
+    // いまの内容に「触った欄」だけを重ねる。開いている間に届いた変更
+    // （気になり帳へ送った印・他の PC での編集や復習の記録）を、開いたときの内容で巻き戻さないため
+    let cur = null;
+    try { cur = (await getAll()).items.find(i => i.id === base.id) || null; } catch { cur = null; }
+    const it = { ...(cur || items.find(i => i.id === base.id) || base) };
+    for (const k of Object.keys(form)) {
+      if (JSON.stringify(form[k]) !== JSON.stringify(was[k])) it[k] = form[k];
+    }
+    if (dueTouched && due) {
+      const d = new Date(due + 'T00:00:00');
       d.setHours(meta.s.hour, 0, 0, 0);
       if (!isNaN(d.getTime())) it.d = d.getTime();
     }
     if (it.s === STATUS.DONE || it.s === STATUS.ARCHIVED) it.d = 0;
     // 学習中／未読に戻したのに期限が無い項目は復習に出てこないので、今すぐ復習対象にする
     else if (!(it.d > 0)) it.d = resume(it, meta, 0).d;
-    editing = null;
-    const wasFocus = !$('focus').classList.contains('hidden');
     await save([it]);
     if (wasFocus) showFocus();                       // 集中復習中なら表示を更新
   });
   $('eCancel').addEventListener('click', () => { editing = null; $('editDlg').close('cancel'); });
+  $('eDel').addEventListener('click', async () => {
+    if (deleting) return;                            // 消している最中の二度押しは無視
+    const it = editing && (items.find(i => i.id === editing.id) || editing);
+    editing = null;
+    $('editDlg').close('cancel');
+    if (!it) return;
+    const inFocus = !$('focus').classList.contains('hidden') && focusQueue[focusIdx] === it.id;
+    if (!(await deleteItems([it]))) return;
+    if (inFocus) focusNext(it.id);                   // 消している間に進んでいたら、さらには進めない
+  });
+  $('toastUndo').onclick = undoLast;
+  $('toastClose').onclick = hideToast;
+  // Ctrl+Z（Mac は ⌘Z）でも元に戻せる。文字を打っている最中は横取りしない
+  document.addEventListener('keydown', (e) => {
+    if (!undoFn || !(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.key.toLowerCase() !== 'z') return;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    if (document.querySelector('dialog[open]')) return;
+    e.preventDefault();
+    undoLast();
+  });
 
   // 設定ダイアログ
   $('btnSettings').onclick = openSettings;
@@ -972,23 +1147,31 @@ function bind() {
     $('setMsg').textContent = 'すべて削除しました。';
   };
 
-  // 集中復習
-  $('fOk').onclick = () => focusAnswer('ok');
-  $('fAgain').onclick = () => focusAnswer('again');
-  $('fLater').onclick = () => focusAnswer('later');
+  // 集中復習（どれも focusGuard を通す。連打やダブルクリックで2枚進めない）
+  $('fOk').onclick = (e) => focusAnswer('ok', e);
+  $('fAgain').onclick = (e) => focusAnswer('again', e);
+  $('fLater').onclick = (e) => focusAnswer('later', e);
   $('fClose').onclick = endFocus;
   $('fOpen').onclick = () => { const it = items.find(i => i.id === focusQueue[focusIdx]); if (it) window.open(it.u, '_blank', 'noopener'); };
   $('fEdit').onclick = () => { const it = items.find(i => i.id === focusQueue[focusIdx]); if (it) openEdit(it); };
-  $('fDone').onclick = async () => {
-    const it = items.find(i => i.id === focusQueue[focusIdx]);
+  $('fDone').onclick = (e) => focusGuard(e, async () => {
+    const id = focusQueue[focusIdx];
+    const it = items.find(i => i.id === id);
     if (it) await save([{ ...it, s: STATUS.DONE, d: 0 }]);
-    focusIdx++; focusIdx >= focusQueue.length ? endFocus() : showFocus();
-  };
-  $('fArch').onclick = async () => {
-    const it = items.find(i => i.id === focusQueue[focusIdx]);
+    focusNext(id);
+  });
+  $('fArch').onclick = (e) => focusGuard(e, async () => {
+    const id = focusQueue[focusIdx];
+    const it = items.find(i => i.id === id);
     if (it) await save([{ ...it, s: STATUS.ARCHIVED, d: 0 }]);
-    focusIdx++; focusIdx >= focusQueue.length ? endFocus() : showFocus();
-  };
+    focusNext(id);
+  });
+  $('fDel').onclick = (e) => focusGuard(e, async () => {
+    const id = focusQueue[focusIdx];
+    const it = items.find(i => i.id === id);
+    if (it && !(await deleteItems([it]))) return;      // 消せなかったら、その項目のまま留まる
+    focusNext(id);
+  });
 
   // キーボード
   document.addEventListener('keydown', (e) => {

@@ -31,7 +31,11 @@ export const RETRY_ALARM = 'recall-clip-retry';
 export const QUEUE_KEY = 'rcClipQueue';
 export const MAX_TRIES = 5;          // これを超えたら自動では送り直さない（手動で再送できる）
 const RETRY_MIN = 5;                 // 自動で送り直す間隔（分）
+// 失敗した項目は、前回から4分たつまで自動では送り直さない。Service Worker はタブの更新などで
+// 頻繁に起き直し、そのたびに送り直すと裏タブが何度も開き、5回の試行をすぐ使い切ってしまう
+export const RETRY_GAP_MS = 4 * 60000;
 const QUEUE_MAX = 200;
+const GONE_PREFIX = 'rcClipGone:';   // session: 送っている間に消された項目の「送った印」
 
 export const CLIP_MESSAGE = {
   saved: '気になり帳に保存しました',
@@ -233,6 +237,30 @@ export async function resetQueueTries() {
   return editQueue(q => q.map(e => ({ ...e, tries: 0, status: '', err: '' })));
 }
 
+/**
+ * 送っている最中に項目が消された。送れたこと自体は事実なので、
+ * 「元に戻す」で戻したときに印ごと戻せるよう控えておく（印が無いと、もう一度送られて二重になる）。
+ * session に置くので、ブラウザを閉じれば消える（元に戻せるのは削除の直後だけ）。
+ */
+async function noteSentWhileGone(id, confirmed) {
+  try { await chrome.storage.session.set({ [GONE_PREFIX + id]: { kn: Date.now(), knc: confirmed ? 1 : 0 } }); }
+  catch { /* 控えられなくても送信自体は済んでいる */ }
+}
+
+/** 元に戻すときに呼ぶ。消していた間に送り終えた分の印 {id: {kn, knc}} を返し、控えは片付ける */
+export async function takeSentWhileGone(ids) {
+  const keys = (ids || []).map(id => GONE_PREFIX + id);
+  if (!keys.length) return {};
+  try {
+    const got = await chrome.storage.session.get(keys);
+    const found = Object.keys(got);
+    if (found.length) await chrome.storage.session.remove(found);
+    const out = {};
+    for (const k of found) out[k.slice(GONE_PREFIX.length)] = got[k];
+    return out;
+  } catch { return {}; }
+}
+
 async function ensureRetryAlarm() {
   try {
     const a = await chrome.alarms.get(RETRY_ALARM);
@@ -251,6 +279,8 @@ let flushing = false;
 
 /**
  * 待ち行列を順番に送る。裏タブは一度に1つしか開かない。
+ * opts.force … 手動の「今すぐ送る」など。試行回数の上限と間隔を無視する
+ * opts.retry … 5分ごとの再送アラーム。間隔（RETRY_GAP_MS）は無視するが上限は守る
  * @returns {{ok:boolean, sent:number, left:number, reason?:string}}
  */
 export async function flushClips(opts) {
@@ -269,6 +299,7 @@ export async function flushClips(opts) {
     }
 
     const force = !!(opts && opts.force);
+    const retry = !!(opts && opts.retry);
     const done = [];
     const attempted = new Set();
     let sent = 0;
@@ -277,7 +308,9 @@ export async function flushClips(opts) {
     // 残りは5分後の再送まで待つことになる。
     for (;;) {
     const q = (await getQueue()).filter(e => !attempted.has(e.id));
-    const todo = q.filter(e => force || (e.tries || 0) < MAX_TRIES);
+    const now = Date.now();
+    const todo = q.filter(e => force || ((e.tries || 0) < MAX_TRIES
+      && (retry || !(e.tries > 0) || now - (e.at || 0) >= RETRY_GAP_MS)));   // 失敗したばかりの分は待つ
     if (!todo.length) break;
     for (const entry of todo) {
       attempted.add(entry.id);
@@ -303,6 +336,7 @@ export async function flushClips(opts) {
         // 送信中に編集されているかもしれないので、いまの内容に印だけを足す
         const latest = (await getAll()).items.find(i => i.id === entry.id);
         if (latest) await putItems([markClipped(latest, res.status === 'saved')]);
+        else await noteSentWhileGone(entry.id, res.status === 'saved');   // 送っている間に消された
         await removeFromQueue(entry.id);
         done.push(entry.id);
         sent++;

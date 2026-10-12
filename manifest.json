@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Recall — 復習ブックマーク",
   "short_name": "Recall",
-  "version": "1.7.0",
+  "version": "1.8.1",
   "description": "ワンクリックでページを保存。カテゴリ・タグで整理して、忘却曲線に沿ったタイミングで復習を通知します。",
   "permissions": [
     "storage",

@@ -8,11 +8,15 @@ export const ITEM_PREFIX = 'i:';          // sync: 同期する項目
 export const LOCAL_PREFIX = 'L:';         // local: 全項目の本体
 export const RICH_PREFIX = 'R:';          // local: サムネイルなどの付随情報（同期しない）
 export const META_KEY = 'meta';
-export const DEL_KEY = 'del';             // sync: 削除の記録（他の端末へ削除を伝える）
+export const DEL_KEY = 'del';             // sync: 削除の記録（他の端末へ削除を伝える。旧バージョン向けの写し）
+export const TOMB_PREFIX = 'del';         // sync: 削除の記録の本体（del1, del2 … に分けて持つ）
+export const TOMB_SHARDS = 10;            // 分ける数の上限（1キー 8KB × 10 ≒ 3000 件）
+export const TOMB_SHARD_BYTES = 8000;     // 1キーあたりの目安（上限 8192 バイトに余白を残す）
 export const WIPE_KEY = 'wipe';           // sync: 「すべて削除」した時刻（他の端末にも伝える）
 export const SYNC_BUDGET_BYTES = 80000;   // 同期に使う上限（100KB のうち meta などの余白を残す）
+export const SYNC_HEADROOM = 8192;        // 削除の記録が増えても meta を書けるように空けておく分
 export const DEL_KEEP_DAYS = 60;
-export const DEL_MAX = 120;
+export const DEL_MAX = 120;               // 旧形式（del）に写す件数（旧バージョンはこれ以上を持たない）
 export const SYNC_QUOTA_BYTES = 102400;
 export const SYNC_MAX_ITEMS = 512;
 export const RESERVED_KEYS = 2; // meta + 予備
@@ -88,6 +92,17 @@ export function clip(str, n) {
 
 export function byteSize(value) {
   return new TextEncoder().encode(typeof value === 'string' ? value : JSON.stringify(value)).length;
+}
+
+/**
+ * CSV の1マス。= + - @ やタブ・改行で始まる値には ' を前に付ける。
+ * ページのタイトルは誰でも決められるので、そのまま書き出すと
+ * 表計算ソフトで開いたときに数式として実行されてしまう。
+ */
+export function csvCell(v) {
+  let s = String(v == null ? '' : v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return `"${s.replace(/"/g, '""')}"`;
 }
 
 const TRACKING_PARAMS = /^(utm_|fbclid|gclid|mc_cid|mc_eid|igshid|yclid|_ga|ref_src|spm)/i;
@@ -401,16 +416,141 @@ export async function setLastNotified(ts) {
 /* ============================================================
    ハイブリッド保存
      local … 全項目の本体（L:<id>）とサムネイル等（R:<id>）。容量無制限。
-     sync  … 直近の項目だけ（i:<id>）と削除の記録（del）。他の PC へ届く分。
+     sync  … 直近の項目だけ（i:<id>）と削除の記録（del, del1..）。他の PC へ届く分。
    ============================================================ */
 
-/** 削除の記録を id → 時刻 の表にする */
-function tombMap(dels) {
+/* ---------- 削除の記録 ----------
+   del1, del2 … に「id → 時刻（36進）」の形で全件を分けて持つ（1キー 8KB の上限に収めるため）。
+   旧バージョンの端末は del（[{i,t}] の形・最大120件）しか読まないので、新しい120件はそこにも写す。
+   一度にたくさん消しても、今回消した分の記録は必ず残す（落とすと他の PC から戻ってくる）。 */
+
+const DAY_MS = 86400000;
+
+/** 削除の記録を分けて持つキー（del1, del2 …）か */
+export function isTombShardKey(k) {
+  return /^del\d+$/.test(k);
+}
+
+/**
+ * 削除の記録を id → 時刻 の表にする。旧形式（del）と分割した形（del1..）の両方を読む。
+ * id は文字列にそろえる（分割した形ではキーになるので、数値の id も文字列になるため）。
+ */
+export function readTombs(ss) {
   const m = new Map();
-  for (const d of (Array.isArray(dels) ? dels : [])) {
-    if (d && d.i) m.set(d.i, Math.max(m.get(d.i) || 0, d.t || 0));
+  const put = (id, t) => {
+    const n = Number(t);
+    if (id == null || id === '' || !Number.isFinite(n) || n <= 0) return;
+    const k = String(id);
+    if (n > (m.get(k) || 0)) m.set(k, n);
+  };
+  const legacy = ss && ss[DEL_KEY];
+  for (const d of (Array.isArray(legacy) ? legacy : [])) if (d && d.i) put(d.i, d.t);
+  for (const [k, v] of Object.entries(ss || {})) {
+    if (!isTombShardKey(k) || !v || typeof v !== 'object') continue;
+    for (const [id, t] of Object.entries(v)) put(id, typeof t === 'string' ? parseInt(t, 36) : t);
   }
   return m;
+}
+
+/**
+ * 削除の記録を書き込む形にする（純粋な関数：テストしやすい）。
+ * 60日を過ぎたものは捨てる。入りきらないときは古いものから捨てるが、keep（今回の分）は必ず先に入れる。
+ * @param {Map<string, number>} tombs
+ * @param {Set<string>} [keep]
+ * @param {Map<string, *>} [orig] 旧形式に写すときの元の id（数値の id を数値のまま写すため）
+ * @returns {{keys: object, kept: number, dropped: number}}
+ */
+export function encodeTombs(tombs, keep = new Set(), now = Date.now(), orig = new Map()) {
+  const list = [...tombs.entries()]
+    .filter(([id, t]) => keep.has(id) || now - t < DEL_KEEP_DAYS * DAY_MS)
+    .sort((a, b) => (keep.has(b[0]) - keep.has(a[0])) || b[1] - a[1]);   // 今回の分 → 新しい順
+  const keys = {};
+  const kept = [];
+  let shard = null, n = 0, bytes = 0;
+  // fromEntries で作る（id が "__proto__" でも普通のキーとして残る）
+  const flush = () => { if (shard) keys[TOMB_PREFIX + n] = Object.fromEntries(shard); };
+  for (const [id, t] of list) {
+    const val = t.toString(36);
+    const add = byteSize(JSON.stringify(id)) + byteSize(JSON.stringify(val)) + 2;   // "id":"t",
+    if (!shard || bytes + add > TOMB_SHARD_BYTES) {
+      if (n >= TOMB_SHARDS) break;                       // 入りきらない古い記録は捨てる
+      flush();
+      shard = []; n++;
+      bytes = byteSize(TOMB_PREFIX + n) + 2;
+    }
+    shard.push([id, val]);
+    bytes += add;
+    kept.push([id, t]);
+  }
+  flush();
+  // 旧形式の写し: 新しい120件を、古い → 新しい の順に（旧バージョンは末尾に足して後ろから残す）
+  const legacy = [];
+  let lb = byteSize(DEL_KEY) + 2;
+  for (const [id, t] of [...kept].sort((a, b) => b[1] - a[1])) {
+    if (legacy.length >= DEL_MAX) break;
+    const e = { i: orig.has(id) ? orig.get(id) : id, t };
+    const add = byteSize(JSON.stringify(e)) + 1;
+    if (lb + add > TOMB_SHARD_BYTES) break;
+    lb += add;
+    legacy.push(e);
+  }
+  keys[DEL_KEY] = legacy.reverse();
+  return { keys, kept: kept.length, dropped: list.length - kept.length };
+}
+
+let tombChain = Promise.resolve();
+/**
+ * 削除の記録の「読む → 直す → 書く」を1つずつ順番に行う。
+ * 同じ画面の中は Promise の鎖で、別のタブ・ポップアップ・Service Worker とは Web Locks で並べる。
+ * 重なると、あとから書いた方が先の記録を消してしまい、消したはずの項目が他の PC から戻ってくる。
+ */
+function withTombLock(fn) {
+  const locks = globalThis.navigator && globalThis.navigator.locks;
+  const run = () => (locks && typeof locks.request === 'function')
+    ? locks.request('recall-tombstones', () => fn())
+    : fn();
+  const p = tombChain.then(run, run);
+  tombChain = p.then(() => {}, () => {});
+  return p;
+}
+
+/**
+ * 削除の記録を書き戻す（withTombLock の中で呼ぶ）。ss は直前に読んだ sync 全体。
+ * 同期の総量（100KB / 512キー）に収まらないときは、更新の古い項目から同期を降ろして場所を空ける
+ * （降ろした項目は各端末に残るので失われない。削除が伝わらない方が取り返しがつかない）。
+ * @param {string[]} [gone] あわせて同期から外すキー（消した項目の i:<id>）
+ * @param {Array} [ids] 今回の id（旧形式に元の型のまま写すため）
+ */
+async function writeTombs(ss, tombs, keep, gone = [], ids = []) {
+  const orig = new Map();
+  for (const d of (Array.isArray(ss[DEL_KEY]) ? ss[DEL_KEY] : [])) if (d && d.i) orig.set(String(d.i), d.i);
+  for (const id of ids) orig.set(String(id), id);
+  const { keys } = encodeTombs(tombs, keep, Date.now(), orig);
+
+  const after = { ...ss };
+  for (const k of gone) delete after[k];
+  for (const k of Object.keys(after)) if (k === DEL_KEY || isTombShardKey(k)) delete after[k];
+  Object.assign(after, keys);
+  const size = (k, v) => byteSize(k) + byteSize(JSON.stringify(v));
+  let total = 0;
+  for (const [k, v] of Object.entries(after)) total += size(k, v);
+  let count = Object.keys(after).length;
+  const evict = [];
+  const fits = () => total <= SYNC_QUOTA_BYTES - SYNC_HEADROOM && count < SYNC_MAX_ITEMS;
+  if (!fits()) {
+    const synced = Object.entries(after).filter(([k]) => k.startsWith(ITEM_PREFIX))
+      .sort((a, b) => stampOf(a[1]) - stampOf(b[1]));      // 更新の古いものから降ろす
+    for (const [k, v] of synced) {
+      if (fits()) break;
+      total -= size(k, v); count--; evict.push(k);
+    }
+  }
+  const stale = Object.keys(ss).filter(k => isTombShardKey(k) && !(k in keys));
+  const drop = [...gone, ...evict, ...stale];
+  if (drop.length) await sync().remove(drop);
+  const changed = {};
+  for (const [k, v] of Object.entries(keys)) if (JSON.stringify(ss[k]) !== JSON.stringify(v)) changed[k] = v;
+  if (Object.keys(changed).length) await sync().set(changed);
 }
 
 /** 項目の「最後に触った時刻」。旧バージョンの項目には up が無いので保存時刻で代用する */
@@ -420,7 +560,7 @@ function stampOf(v) {
 
 /** その項目が削除済みか（個別の削除、または「すべて削除」より前の内容か） */
 function isDeleted(id, stamp, tombAt, wipedAt) {
-  const t = tombAt.get(id);
+  const t = tombAt.get(String(id));
   if (t && stamp <= t) return true;
   // 「すべて削除」と同じミリ秒に保存された項目は残す側に倒す
   //（消しすぎるより、消え残る方が取り返しがつく）
@@ -442,7 +582,7 @@ export async function getAll() {
 
   // 削除の記録を先に読む。取り込みより後に見ると
   // 「取り込む → 消す」を毎回くり返して書き込みが止まらなくなる。
-  const tombAt = tombMap(ss[DEL_KEY]);
+  const tombAt = readTombs(ss);
   const wipedAt = Number(ss[WIPE_KEY]) || 0;
 
   // 他の PC で保存・更新されたものを取り込む（削除済みのものは取り込まない）
@@ -521,7 +661,7 @@ export async function syncPush() {
   try {
     const [ls, ss] = await Promise.all([local().get(null), sync().get(null)]);
     const meta = mergeMeta(ss[META_KEY]);
-    const tombAt = tombMap(ss[DEL_KEY]);
+    const tombAt = readTombs(ss);
     const wipedAt = Number(ss[WIPE_KEY]) || 0;
     const all = Object.entries(ls)
       .filter(([k, v]) => k.startsWith(LOCAL_PREFIX) && v && v.u)
@@ -529,15 +669,25 @@ export async function syncPush() {
       .map(([, v]) => v);
     const localIds = new Set(all.map(i => i.id));
 
+    // 削除の記録や設定が増えた分だけ、項目に使える量を減らす
+    // （同期全体の 100KB / 512キーを超えると、削除の記録まで書けなくなるため）
+    let otherBytes = 0, otherKeys = 0;
+    for (const [k, v] of Object.entries(ss)) {
+      if (k.startsWith(ITEM_PREFIX)) continue;
+      otherBytes += byteSize(k) + byteSize(JSON.stringify(v));
+      otherKeys++;
+    }
+    const budget = Math.min(SYNC_BUDGET_BYTES, SYNC_QUOTA_BYTES - otherBytes - SYNC_HEADROOM);
+
     const want = [];
     if (meta.s.sync !== false) {
       const sorted = [...all].sort((a, b) => (b.up || b.cr || 0) - (a.up || a.cr || 0));
-      const maxCount = Math.max(0, Number(meta.s.syncMax) || 300);
+      const maxCount = Math.min(Math.max(0, Number(meta.s.syncMax) || 300), SYNC_MAX_ITEMS - otherKeys - 1);
       let bytes = 0;
       for (const it of sorted) {
         if (want.length >= maxCount) break;
         const b = itemBytes(it);
-        if (bytes + b > SYNC_BUDGET_BYTES) break;
+        if (bytes + b > budget) break;
         bytes += b;
         want.push(it);
       }
@@ -574,16 +724,42 @@ export async function removeItems(ids) {
     return { ok: false, error: describeLocalError(e) };
   }
   try {
-    // 他の PC にも削除を伝えるため、記録を残す（60日 / 120件まで）
-    const ss = await sync().get(DEL_KEY);
-    const now = Date.now();
-    const keep = (Array.isArray(ss[DEL_KEY]) ? ss[DEL_KEY] : [])
-      .filter(d => d && d.i && now - d.t < DEL_KEEP_DAYS * 86400000 && !ids.includes(d.i));
-    for (const id of ids) keep.push({ i: id, t: now });
-    await sync().remove(ids.map(id => ITEM_PREFIX + id));
-    await sync().set({ [DEL_KEY]: keep.slice(-DEL_MAX) });
+    // 他の PC にも削除を伝えるため、記録を残す（60日まで。今回消した分は件数によらず必ず残す）
+    await withTombLock(async () => {
+      const ss = await sync().get(null);
+      const gone = ids.map(id => ITEM_PREFIX + id);
+      // 同期オフ（この端末のみ）のときは記録を残さない。
+      // 残すと、同期していた頃から他の PC にある同じ項目まで消してしまい、元に戻すでも戻らない
+      if (mergeMeta(ss[META_KEY]).s.sync === false) { await sync().remove(gone); return; }
+      const tombs = readTombs(ss);
+      const now = Date.now();
+      for (const id of ids) tombs.set(String(id), now);
+      await writeTombs(ss, tombs, new Set(ids.map(String)), gone, ids);
+    });
   } catch { /* 同期側の後片付けに失敗しても本体は消えている */ }
   return { ok: true };
+}
+
+/**
+ * 削除を取り消す（「元に戻す」）。
+ * 先に削除の記録を外してから保存し直す。保存し直すと更新時刻が新しくなるので、
+ * 記録が他の PC に届いて向こうで消えたあとでも、同期でまた戻ってくる。
+ * 記録を外しておくのは、同期に載らない分（上限を超えた分・同期オフ）を
+ * 他の PC で消させないため。
+ */
+export async function restoreItems(list, richMap) {
+  if (!list || !list.length) return { ok: true, count: 0 };
+  const ids = new Set(list.map(i => String(i.id)));
+  try {
+    await withTombLock(async () => {
+      const ss = await sync().get(null);
+      const tombs = readTombs(ss);
+      let hit = false;
+      for (const id of ids) if (tombs.delete(id)) hit = true;
+      if (hit) await writeTombs(ss, tombs, new Set());
+    });
+  } catch { /* 記録が残っても、保存し直した時刻の方が新しいので消えない */ }
+  return putItems(list.map(i => ({ ...i })), richMap);
 }
 
 /** すべて消す（設定ダイアログの「すべて削除」） */
