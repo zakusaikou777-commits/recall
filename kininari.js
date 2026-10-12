@@ -7,7 +7,7 @@
    ものを、そのまま持ち込んでいる（取りこぼし・二重報告・タブの
    開きっぱなしを避けるための工夫がすべて入っている）。
    ============================================================ */
-import { clip, thumbOf, normalizeUrl, getAll, putItems, STATUS } from './store.js';
+import { clip, thumbOf, normalizeUrl, getAll, putItems, STATUS, DEFAULT_STEPS } from './store.js';
 
 /** 気になり帳が受け付けるカテゴリ（これ以外は「調べる」になる） */
 export const KN_CATEGORIES = ['メモ', 'アイデア', '調べる', 'やること', '行きたい'];
@@ -39,6 +39,9 @@ const GONE_PREFIX = 'rcClipGone:';   // session: 送っている間に消され�
 
 export const CLIP_MESSAGE = {
   saved: '気になり帳に保存しました',
+  dup: '気になり帳にはもう入っていました（二重には登録していません）',
+  quota: '気になり帳の保存容量がいっぱいで、保存できませんでした。気になり帳で不要なメモや画像を減らしてから、もう一度送ってください',
+  parse: '気になり帳が受け取った内容を読めませんでした。気になり帳を新しい版にしてから、もう一度送ってください',
   blind: '気になり帳を開きました（保存できたかは未確認）',
   unconfirmed: '保存を確認できませんでした。保存先URLを確かめてください',
   closed: '裏のタブが閉じられたため、保存できたか分かりません',
@@ -48,6 +51,35 @@ export const CLIP_MESSAGE = {
 };
 
 /* ---------- 送る内容を組み立てる（純粋な関数：テストしやすい） ---------- */
+
+/** 気になり帳の復習の間隔（日）。気になり帳側は固定で、設定では変えられない */
+export const KN_STEPS = [1, 3, 7, 14, 30, 60, 120];
+
+/**
+ * クリップの番号。気になり帳は、同じ番号が二度届いたら2件目を作らない（30日・500件まで覚えている）。
+ * 送り直しでも同じ番号を使えば、1回目が実は届いていたときに二重に登録されない。
+ */
+export const NONCE_RE = /^[0-9a-f]{8,64}$/;
+export function newClipNonce() {
+  const a = new Uint8Array(16);
+  crypto.getRandomValues(a);
+  return [...a].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Recall の段位を、気になり帳でいちばん近い間隔の段に置き換える。
+ * Recall は間隔を設定で変えられるので、同じ「何段目」でも日数が違うことがある
+ * （そのまま送ると、気になり帳で「覚えた」を押したときの伸び方がずれる）。
+ */
+export function knBox(b, steps) {
+  const st = steps && steps.length ? steps : DEFAULT_STEPS;
+  const days = Number(st[Math.min(Math.max(0, Math.round(Number(b) || 0)), st.length - 1)]) || 1;
+  let best = 0;
+  for (let i = 1; i < KN_STEPS.length; i++) {
+    if (Math.abs(KN_STEPS[i] - days) < Math.abs(KN_STEPS[best] - days)) best = i;
+  }
+  return best;
+}
 
 /**
  * 気になり帳のメモ本文に載せる文章。メモ本体のあとにタグを並べる。
@@ -80,6 +112,7 @@ export function buildClipUrl(base, fields) {
     };
     if (fields.tags && fields.tags.length) p.tags = fields.tags;
     if (fields.srs) p.srs = fields.srs;          // 復習の進み具合をそのまま引き継ぐ
+    if (NONCE_RE.test(String(fields.nonce || ''))) p.k = fields.nonce;   // クリップの番号（二重登録よけ）
     return p;
   };
   const render = (p) => head + encodeURIComponent(JSON.stringify(p));
@@ -114,7 +147,7 @@ export function clipFieldsFor(item, meta, rich) {
     category: meta.s.knCat,
     folder: cat ? cat.name : '',         // Recall のカテゴリ＝気になり帳のフォルダ
     tags: (item.g || []).slice(0, 12),
-    srs: srsFor(item)
+    srs: srsFor(item, meta.s && meta.s.steps)
   };
 }
 
@@ -122,11 +155,11 @@ export function clipFieldsFor(item, meta, rich) {
  * Recall の復習状態を気になり帳の形にそろえる。
  * 気になり帳側は 0=未読 / 1=学習中 / 2=完了 の3つ。アーカイブは復習に入れない。
  */
-export function srsFor(item) {
+export function srsFor(item, steps) {
   if (item.s === STATUS.ARCHIVED) return null;
   const st = item.s === STATUS.DONE ? 2 : (item.s === STATUS.LEARNING ? 1 : 0);
   return {
-    b: Math.max(0, Number(item.b) || 0),
+    b: knBox(item.b, steps),
     d: st === 2 ? 0 : Math.max(0, Number(item.d) || 0),
     rv: Math.max(0, Number(item.rv) || 0),
     st,
@@ -156,13 +189,18 @@ export function alreadyClipped(item) {
  * confirmed=false は「気になり帳を開いたが、保存できたかは確かめていない」状態
  * （保存の確認を許可していないとき）。画面では「未確認」と出して送り直せるようにする。
  */
-export function markClipped(item, confirmed) {
-  return { ...item, kn: Date.now(), knc: confirmed ? 1 : 0 };
+export function markClipped(item, confirmed, nonce) {
+  const out = { ...item, kn: Date.now(), knc: confirmed ? 1 : 0 };
+  if (NONCE_RE.test(String(nonce || ''))) out.knk = nonce;   // 送り直すときに同じ番号を使うため
+  return out;
 }
 
 /** 項目の送信状態を一言で表す */
 export function clipStateOf(item, queueEntry) {
   if (queueEntry) {
+    // 気になり帳から理由が返ってきたもの（自動では送り直さない）
+    if (queueEntry.status === 'quota') return { key: 'stuck', text: '送れていません（気になり帳の保存容量がいっぱい）' };
+    if (queueEntry.status === 'parse') return { key: 'stuck', text: '送れていません（気になり帳が受け取れない形式）' };
     if (queueEntry.tries >= MAX_TRIES) return { key: 'stuck', text: `送れていません（${queueEntry.tries}回失敗）` };
     return { key: 'pending', text: queueEntry.tries ? `送信待ち（${queueEntry.tries}回失敗）` : '送信待ち' };
   }
@@ -210,13 +248,17 @@ function editQueue(fn) {
   });
 }
 
-/** 送信の予約。すでに並んでいれば何もしない。いっぱいなら断る（黙って捨てない） */
-export async function enqueueClip(id) {
+/**
+ * 送信の予約。すでに並んでいれば何もしない。いっぱいなら断る（黙って捨てない）。
+ * opts.nonce … 前に送ったときの番号を使い回す（届いていたかどうか分からない分を送り直すとき）
+ */
+export async function enqueueClip(id, opts = {}) {
   let refused = false;
+  const k = NONCE_RE.test(String(opts.nonce || '')) ? opts.nonce : newClipNonce();
   const next = await editQueue(q => {
     if (q.some(e => e.id === id)) return null;
     if (q.length >= QUEUE_MAX) { refused = true; return null; }   // 古い方を守る
-    q.push({ id, at: Date.now(), tries: 0, status: '', err: '' });
+    q.push({ id, at: Date.now(), tries: 0, status: '', err: '', k });
     return q;
   });
   return { ok: !refused, refused, size: next.length };
@@ -226,9 +268,10 @@ export async function removeFromQueue(id) {
   return editQueue(q => q.filter(e => e.id !== id));
 }
 
-async function noteFailure(id, status, err) {
+/** giveUp … 待っても直らない失敗（気になり帳の容量不足など）。自動では送り直さず、「今すぐ送る」を待つ */
+async function noteFailure(id, status, err, giveUp) {
   return editQueue(q => q.map(e => e.id === id
-    ? { ...e, tries: (e.tries || 0) + 1, status, err: String(err || '').slice(0, 200), at: Date.now() }
+    ? { ...e, tries: giveUp ? Math.max(MAX_TRIES, (e.tries || 0) + 1) : (e.tries || 0) + 1, status, err: String(err || '').slice(0, 200), at: Date.now() }
     : e));
 }
 
@@ -242,8 +285,10 @@ export async function resetQueueTries() {
  * 「元に戻す」で戻したときに印ごと戻せるよう控えておく（印が無いと、もう一度送られて二重になる）。
  * session に置くので、ブラウザを閉じれば消える（元に戻せるのは削除の直後だけ）。
  */
-async function noteSentWhileGone(id, confirmed) {
-  try { await chrome.storage.session.set({ [GONE_PREFIX + id]: { kn: Date.now(), knc: confirmed ? 1 : 0 } }); }
+async function noteSentWhileGone(id, confirmed, nonce) {
+  const mark = { kn: Date.now(), knc: confirmed ? 1 : 0 };
+  if (NONCE_RE.test(String(nonce || ''))) mark.knk = nonce;
+  try { await chrome.storage.session.set({ [GONE_PREFIX + id]: mark }); }
   catch { /* 控えられなくても送信自体は済んでいる */ }
 }
 
@@ -316,6 +361,7 @@ async function flushOnce(opts) {
     const force = !!(opts && opts.force);
     const retry = !!(opts && opts.retry);
     const done = [];
+    const results = {};          // 項目ごとの結果（saved / dup / blind / quota / parse / …）
     const attempted = new Set();
     let sent = 0;
     // 送信中に新しく積まれた分も同じ回で送る。
@@ -337,7 +383,13 @@ async function flushOnce(opts) {
       const item = items.find(i => i.id === entry.id);
       if (!item) { await removeFromQueue(entry.id); continue; }   // 消された項目は送らない
 
-      const built = buildClipUrl(meta.s.knUrl, clipFieldsFor(item, meta, rich[item.id]));
+      // 番号は待ち行列の項目に持たせ、送り直しでも同じものを使う（前の版で積んだ分には、ここで振る）
+      let k = entry.k;
+      if (!NONCE_RE.test(String(k || ''))) {
+        k = newClipNonce();
+        await editQueue(q => q.map(e => (e.id === entry.id ? { ...e, k } : e)));
+      }
+      const built = buildClipUrl(meta.s.knUrl, { ...clipFieldsFor(item, meta, rich[item.id]), nonce: k });
       if (!built.url) { await noteFailure(entry.id, 'toolong', '内容が大きすぎます'); continue; }
       // http/https 以外はタブが開けても中身が動かない。
       // 「開いたから送れたことにする」と、URLの打ち間違いが静かに握りつぶされる。
@@ -347,14 +399,20 @@ async function flushOnce(opts) {
       }
 
       const res = await startClipAwait(built.url);
-      if (res.status === 'saved' || res.status === 'blind') {
+      results[entry.id] = res.status;
+      if (res.status === 'saved' || res.status === 'dup' || res.status === 'blind') {
+        // dup … 気になり帳にはもう入っていた（前の送信が届いていた）。確かめられたので「送信済み」にする
+        const confirmed = res.status !== 'blind';
         // 送信中に編集されているかもしれないので、いまの内容に印だけを足す
         const latest = (await getAll()).items.find(i => i.id === entry.id);
-        if (latest) await putItems([markClipped(latest, res.status === 'saved')]);
-        else await noteSentWhileGone(entry.id, res.status === 'saved');   // 送っている間に消された
+        if (latest) await putItems([markClipped(latest, confirmed, k)]);
+        else await noteSentWhileGone(entry.id, confirmed, k);   // 送っている間に消された
         await removeFromQueue(entry.id);
         done.push(entry.id);
         sent++;
+      } else if (res.status === 'quota' || res.status === 'parse') {
+        // 気になり帳が理由を返してきた。待っても直らないので、自動では送り直さない
+        await noteFailure(entry.id, res.status, CLIP_MESSAGE[res.status], true);
       } else {
         await noteFailure(entry.id, res.status, res.err);
       }
@@ -364,7 +422,7 @@ async function flushOnce(opts) {
     const left = await getQueue();
     if (left.some(e => (e.tries || 0) < MAX_TRIES)) await ensureRetryAlarm();
     else await clearRetryAlarm();
-    return { ok: true, sent, left: left.length, done };
+    return { ok: true, sent, left: left.length, done, results };
   } catch (e) {
     return { ok: false, sent: 0, left: (await getQueue()).length, reason: String((e && e.message) || e) };
   }
@@ -452,15 +510,39 @@ async function canScript(origin) {
   try { return await chrome.permissions.contains({ origins: [origin] }); } catch { return false; }
 }
 
-/** 保存完了の印はページ本体（MAIN）に立つ。結合アプリでは iframe の中なので全フレームを見る */
-async function savedInTab(tabId) {
+/**
+ * 気になり帳の返事を読む。返事はページ本体（MAIN）に立つ。結合アプリ（index.html）では iframe の中なので全フレームを見る。
+ *   __kininariClipStatus … 'saved' / 'dup'（もう入っていた）/ 'quota'（容量不足）/ 'parse'（形式エラー）
+ *   __kininariClipSaved  … 保存できた（古い版の気になり帳はこれだけを立てる）
+ * @returns {{done: boolean, status?: string}|null} null は権限が無い・まだ読み込み中
+ */
+export function readClipReply(values) {
+  let saved = false;
+  const statuses = [];
+  for (const v of values || []) {
+    if (v === true) saved = true;
+    else if (v && typeof v === 'object') {
+      if (v.saved) saved = true;
+      if (typeof v.status === 'string' && v.status) statuses.push(v.status);
+    }
+  }
+  const bad = statuses.find(st => st === 'quota' || st === 'parse');
+  if (bad) return { done: true, status: bad };
+  if (saved) return { done: true, status: statuses.includes('dup') ? 'dup' : 'saved' };
+  return { done: false };
+}
+
+async function clipReplyInTab(tabId) {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       world: 'MAIN',
-      func: () => { try { if (window.__kininariClipSaved) return true; } catch { /* 無視 */ } return false; }
+      func: () => {
+        try { return { saved: !!window.__kininariClipSaved, status: String(window.__kininariClipStatus || '') }; }
+        catch { return { saved: false, status: '' }; }
+      }
     });
-    return (results || []).some(r => r && r.result === true);
+    return readClipReply((results || []).map(r => r && r.result));
   } catch { return null; }   // 権限が無い・まだ読み込み中
 }
 
@@ -471,7 +553,7 @@ async function report(tabId, status, err) {
     const send = responders.get(tabId);
     if (send) {
       responders.delete(tabId);
-      try { send({ ok: status === 'saved', status, err: err || '', message: CLIP_MESSAGE[status] || '' }); } catch { /* 続行 */ }
+      try { send({ ok: status === 'saved' || status === 'dup', status, err: err || '', message: CLIP_MESSAGE[status] || '' }); } catch { /* 続行 */ }
     }
   }
 }
@@ -524,7 +606,8 @@ async function watch(tabId) {
       if (!(await tabExists(tabId))) { await abandon(tabId); return; }
       const now = Date.now();
       if (await canScript(st.origin)) {
-        if ((await savedInTab(tabId)) === true) { await finish(tabId, 'saved'); return; }
+        const reply = await clipReplyInTab(tabId);
+        if (reply && reply.done) { await finish(tabId, reply.status); return; }
         if (now - st.startedAt >= POLL_MAX_MS || now >= st.hardAt) { await finish(tabId, 'unconfirmed'); return; }
       } else {
         // 保存の確認ができない場合。「タブを作れた」だけで送れたことにすると、

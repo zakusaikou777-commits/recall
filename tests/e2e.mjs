@@ -437,6 +437,10 @@ const openedTabs = [];
 const onPage = (pg) => { openedTabs.push(pg); };   // 通知時点では about:blank なので後で URL を見る
 ctx.on('page', onPage);
 const clipTabsNow = () => openedTabs.filter(pg => pg.url().includes('#knadd='));
+const waitUntilTabs = async (n, ms = 15000) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end && clipTabsNow().length < n) await lib.waitForTimeout(250);
+};
 
 // 前のセクションで保存済みの動画と重ならないよう、新しい動画IDを使う
 const knPop = await openPopup('https://www.youtube.com/watch?v=knTestVid01', '送信テストの動画', 'kn-popup');
@@ -465,6 +469,7 @@ ok('YouTube のサムネイルURLが付く', sent && /i\.ytimg\.com\/vi\/knTestV
 ok('タグを項目として送る', sent && Array.isArray(sent.tags) && sent.tags.includes('テストタグ'));
 ok('復習の進み具合を送る', sent && sent.srs && typeof sent.srs.d === 'number' && sent.srs.d > 0);
 eq2('新しい項目は未読で送る', sent && sent.srs && sent.srs.st, 0);
+ok('クリップの番号を付けて送る（気になり帳が二重登録を防ぐ）', sent && /^[0-9a-f]{32}$/.test(sent.k || ''));
 
 // 送った印が付き、裏タブは自動で閉じられる
 const clipped = (await readItems()).find(i => i.u.includes('knTestVid01'));
@@ -480,6 +485,17 @@ await knPop2.fill('#note', 'あとから直したメモ');
 await knPop2.click('#save');
 await lib.waitForTimeout(3500);
 ok('更新では送らない', clipTabsNow().length === clipsBefore);
+ok('送った番号を項目に残す', (await readItems()).find(i => i.u.includes('knTestVid01')).knk === sent.k);
+
+// 「送信済み（未確認）」を送り直すときは同じ番号で（届いていれば気になり帳が「もう入っている」と返す）
+const knPop3 = await openPopup('https://www.youtube.com/watch?v=knTestVid01', '送信テストの動画', 'kn-popup3');
+ok('未確認の項目には送り直しのボタンが出る', await knPop3.locator('#knSend').isVisible());
+await knPop3.click('#knSend');
+await waitUntilTabs(clipsBefore + 1);
+const resent = clipTabsNow().slice(clipsBefore).map(pg => { try { return JSON.parse(decodeURIComponent(pg.url().split('#knadd=')[1])); } catch { return null; } })[0];
+eq2('回帰: 未確認の送り直しは同じ番号を使う', resent && resent.k, sent && sent.k);
+await lib.waitForTimeout(12000);
+await knPop3.close().catch(() => {});
 
 section('回帰: 裏タブは一度に1つ');
 // 権限を許可していない状態で複数件を送っても、裏タブが一斉に開かないこと
@@ -1209,6 +1225,130 @@ await lib.fill('#sSyncMax', '0');
 await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(WAIT);
 eq2('回帰: 同期する件数の上限を 0 にできる', (await lib.evaluate(async () => (await chrome.storage.sync.get('meta')).meta.s.syncMax)), 0);
 eq2('上限 0 なら同期に載らない', await countSynced(), 0);
+
+section('1.9.0: Google ドライブ同期');
+eq2('拡張機能の ID が固定されている（フォルダの場所によらない）', id, 'kcgmjcokekapobnjijclhlhnaccdpkpp');
+await freshStore();
+await seedItems(2, { prefix: 'gd', title: 'ドライブ' });
+await openLib('all');
+const manifestOnDisk = JSON.parse(fs.readFileSync(path.join(EXT, 'manifest.json'), 'utf8'));
+const realCid = manifestOnDisk.oauth2 && manifestOnDisk.oauth2.client_id;
+ok('manifest に OAuth クライアント ID が入っている', /^[\w.-]+\.apps\.googleusercontent\.com$/.test(realCid || '') && !/YOUR_CLIENT_ID/.test(realCid));
+await lib.click('#btnSettings'); await lib.waitForTimeout(800);
+ok('つなぐ前は「つないでいません」と出る', (await lib.locator('#gdStatus').innerText()).includes('つないでいません'));
+ok('「つなぐ」を押せる', !(await lib.locator('#gdConnect').isDisabled()));
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
+await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'driveStatus' }));
+sw = ctx.serviceWorkers().filter(w => w.url().includes(id)).pop() || await ctx.waitForEvent('serviceworker', { timeout: 10000 });
+// client_id が未設定の版（フォークした人など）では「準備がまだ」と出て、押せない
+await sw.evaluate(() => {
+  self.__realGetManifest = chrome.runtime.getManifest;
+  const real = chrome.runtime.getManifest();
+  chrome.runtime.getManifest = () => ({ ...real, oauth2: { ...real.oauth2, client_id: 'YOUR_CLIENT_ID.apps.googleusercontent.com' } });
+});
+await lib.click('#btnSettings'); await lib.waitForTimeout(800);
+ok('client_id が未設定なら「準備がまだ」と出る', (await lib.locator('#gdStatus').innerText()).includes('準備がまだ'));
+ok('そのときは「つなぐ」を押せない', await lib.locator('#gdConnect').isDisabled());
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
+// Service Worker に、Google の許可とドライブの代わりを差し込む（本物の Google には送らない）
+await sw.evaluate(() => {
+  chrome.runtime.getManifest = self.__realGetManifest;
+  chrome.identity.getAuthToken = async () => ({ token: 'e2e-token' });
+  chrome.identity.removeCachedAuthToken = async () => {};
+  const fd = self.__fakeDrive = {
+    files: new Map(), seq: 0,
+    byName(n) { return [...this.files.values()].filter(f => f.name === n); }
+  };
+  const res = (status, body, text) => new Response(text !== undefined ? text : JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+  const realFetch = self.fetch.bind(self);
+  self.fetch = async (url, init = {}) => {
+    const u = new URL(String(url && url.url || url));
+    // Google 以外（通知のアイコンの読み込みなど）は本物に任せる
+    if (!/(^|\.)googleapis\.com$|^accounts\.google\.com$/.test(u.hostname)) return realFetch(url, init);
+    const method = (init.method || 'GET').toUpperCase();
+    if (u.hostname === 'accounts.google.com') return res(200, {});
+    if (u.pathname === '/drive/v3/files' && method === 'GET') {
+      const q = u.searchParams.get('q') || '';
+      const eqm = q.match(/name = '([^']+)'/), cm = q.match(/name contains '([^']+)'/);
+      let files = [...fd.files.values()];
+      if (eqm) files = files.filter(f => f.name === eqm[1]);
+      if (cm) files = files.filter(f => f.name.includes(cm[1]));
+      return res(200, { files: files.map(f => ({ id: f.id, name: f.name, version: String(f.version), size: String(f.content.length) })) });
+    }
+    if (u.pathname === '/drive/v3/files' && method === 'POST') {
+      const id = 'f' + (++fd.seq);
+      fd.files.set(id, { id, name: JSON.parse(init.body).name, content: '', version: 1 });
+      return res(200, { id, version: '1' });
+    }
+    let m = u.pathname.match(/^\/drive\/v3\/files\/([^/]+)$/);
+    if (m && method === 'GET') return res(200, null, fd.files.get(m[1]).content);
+    if (m && method === 'DELETE') { fd.files.delete(m[1]); return new Response(null, { status: 204 }); }
+    m = u.pathname.match(/^\/upload\/drive\/v3\/files\/([^/]+)$/);
+    if (m && method === 'PATCH') { const f = fd.files.get(m[1]); f.content = init.body; f.version++; return res(200, { id: f.id, version: String(f.version) }); }
+    return res(400, { error: { code: 400, message: 'unexpected' } });
+  };
+});
+await lib.click('#btnSettings'); await lib.waitForTimeout(800);
+ok('準備ができていれば「つなぐ」を押せる', !(await lib.locator('#gdConnect').isDisabled()));
+await lib.click('#gdConnect');
+const gdDone = async () => { const t = (await lib.locator('#gdMsg').innerText()).trim(); return !!t && !t.endsWith('…'); };   // 「…しています…」の間は待つ
+await waitUntil(gdDone, 15000);
+ok('つなぐとすぐ同期する', (await lib.locator('#gdMsg').innerText()).includes('つなぎました'));
+await waitUntil(async () => (await lib.locator('#gdStatus').innerText()).includes('同期しています'), 5000);
+ok('状態に「同期しています」と出る', (await lib.locator('#gdStatus').innerText()).includes('同期しています'));
+eq2('ドライブに全件が載る', await sw.evaluate(() => JSON.parse(self.__fakeDrive.byName('recall-sync.json')[0].content).items.length), 2);
+ok('その日のバックアップも作られる', await sw.evaluate(() => [...self.__fakeDrive.files.values()].some(f => f.name.startsWith('recall-backup-'))));
+// ほかの PC がドライブに足した項目を「今すぐ同期」で取り込む
+await sw.evaluate(() => {
+  const f = self.__fakeDrive.byName('recall-sync.json')[0];
+  const d = JSON.parse(f.content);
+  const now = Date.now();
+  d.items.push({ id: 'remote1', u: 'https://drive-remote.example/1', t: 'ほかの PC から', n: '', c: 'c0', g: [], s: 1, f: 0, b: 0, d: now + 86400000, cr: now, rv: 0, iv: 0, kn: 0, knc: 0, up: now });
+  f.content = JSON.stringify(d); f.version++;
+});
+await lib.click('#gdSync');
+await waitUntil(gdDone, 15000);
+ok('ほかの PC の項目を取り込む', (await lib.locator('#gdMsg').innerText()).includes('1 件を取り込み'));
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(1200);
+ok('取り込んだ項目が一覧に出る', (await lib.locator('#list .card a.title').allInnerTexts()).some(t => t.includes('ほかの PC から')));
+await lib.click('#btnSettings'); await lib.waitForTimeout(800);
+await lib.locator('#gdBackupBox summary').click();
+await waitUntil(async () => (await lib.locator('#gdBackups li').count()) > 0, 8000);
+ok('ドライブのバックアップが一覧に出る', (await lib.locator('#gdBackups li').first().innerText()).includes('この日の状態から戻す'));
+await lib.evaluate(() => { window.confirm = () => true; });
+await lib.click('#gdDisconnect');
+await waitUntil(async () => (await lib.locator('#gdMsg').innerText()).includes('やめました'), 8000);
+ok('同期をやめられる', (await lib.evaluate(async () => (await chrome.storage.sync.get('meta')).meta.s.driveOn)) === false);
+ok('やめたら「つなぐ」に戻る', await waitUntil(async () => lib.locator('#gdConnect').isVisible(), 5000));
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
+
+// 許可が切れて裏の同期が止まったら、通知で知らせる（テスト中のアプリは許可が7日で切れることがある）
+await sw.evaluate(() => { chrome.identity.getAuthToken = async () => { throw new Error('OAuth2 not granted or revoked.'); }; });
+await lib.evaluate(async () => {
+  const m = (await chrome.storage.sync.get('meta')).meta;
+  await chrome.storage.sync.set({ meta: { ...m, s: { ...m.s, driveOn: true } } });
+  await chrome.storage.local.remove('rcDriveAlert');
+});
+const softRes = await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'driveSync', soft: true }));
+eq2('許可が切れていると同期は止まる', softRes && softRes.reason, 'auth');
+ok('「同期が止まっています」と通知する', await waitUntil(async () => 'recall-drive' in (await sw.evaluate(() => chrome.notifications.getAll())), 5000));
+await sw.evaluate(() => chrome.notifications.clear('recall-drive'));
+await lib.evaluate(() => chrome.runtime.sendMessage({ type: 'driveSync', soft: true }));
+await lib.waitForTimeout(800);
+ok('同じ日のうちは2回目の通知を出さない', !('recall-drive' in (await sw.evaluate(() => chrome.notifications.getAll()))));
+await lib.goto('about:blank');
+await lib.goto(url('library.html#drive')); await lib.waitForTimeout(1500);       // ライブラリが開いていないとき
+ok('通知から開くと設定の「Google ドライブ同期」が出る', await lib.locator('#setDlg').evaluate(d => d.open) && await lib.locator('#gdStatus').isVisible());
+ok('そこに「つなぎ直す」がある', await waitUntil(async () => (await lib.locator('#gdConnect').innerText()).includes('つなぎ直す'), 5000));
+ok('開いたあとは一覧の表示に戻す', (await lib.evaluate(() => location.hash)) === '#all');
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
+await lib.evaluate(() => { location.hash = 'drive'; });                          // ライブラリがもう開いているとき
+ok('開いているライブラリでも設定が出る', await waitUntil(async () => lib.locator('#setDlg').evaluate(d => d.open), 5000));
+await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(800);
+await lib.evaluate(async () => {
+  const m = (await chrome.storage.sync.get('meta')).meta;
+  await chrome.storage.sync.set({ meta: { ...m, s: { ...m.s, driveOn: false } } });
+});
 
 section('後片付け');
 const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));

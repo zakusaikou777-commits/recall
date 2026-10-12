@@ -6,7 +6,8 @@
 import {
   getAll, putItem, putItems, makeItem, findByUrl,
   getLastNotified, setLastNotified, syncPush,
-  isDue, domainOf, isSavableUrl, setMeta, pickCat, META_KEY, ITEM_PREFIX, LOCAL_PREFIX
+  isDue, domainOf, isSavableUrl, setMeta, getMeta, pickCat,
+  META_KEY, ITEM_PREFIX, LOCAL_PREFIX, RICH_PREFIX, LOCAL_TOMBS_KEY, WIPE_KEY
 } from './store.js';
 import { collectPageMeta } from './pagemeta.js';
 import {
@@ -14,6 +15,9 @@ import {
   enqueueClip, flushClips, queueSummary, resetQueueTries, removeFromQueue,
   clipEnabled, clipStateOf, CLIP_ALARM, RETRY_ALARM, CLIP_MESSAGE
 } from './kininari.js';
+import {
+  syncDrive, connectDrive, disconnectDrive, driveStatus, listBackups, getBackup, driveAlertFor, DRIVE_ALARM
+} from './drive.js';
 
 const TICK = 'recall-tick';
 const NOTIF_ID = 'recall-due';
@@ -66,6 +70,7 @@ async function runSetup() {
     // 起動時の設定を控えておく（次に変わったときだけ再送のきっかけにする）
     try { await writeClipCfg(clipCfgOf((await getAll()).meta)); } catch { /* 続行 */ }
     await flushClips();              // 前回送れなかった分を送り直す
+    await syncDriveInBackground();   // Google ドライブの最新を取り込む（オフなら何もしない）
     try { await chrome.storage.session.set({ [SETUP_KEY]: true }); } catch { /* 次に起きたときにやり直すだけ */ }
   } catch (e) {
     console.warn('[Recall] setup error', e);
@@ -94,7 +99,8 @@ function buildMenus() {
 /* ---------- 期限チェック ---------- */
 
 chrome.alarms.onAlarm.addListener(async (a) => {
-  if (a.name === TICK) await refresh();
+  if (a.name === TICK) { await refresh(); await syncDriveInBackground(); }   // ドライブ同期も30分ごとに確かめる
+  if (a.name === DRIVE_ALARM) await syncDriveInBackground();                 // 変更のあと少し待ってから送る
   if (a.name === CLIP_ALARM) await sweepClips();
   if (a.name === RETRY_ALARM) await flushClips({ retry: true });   // 送れなかった分の再送（5分ごと）
 });
@@ -115,8 +121,11 @@ async function sendToKininari(itemId, sendResponse) {
   if (!clipEnabled(meta)) { sendResponse({ ok: false, status: 'off', message: CLIP_MESSAGE.off }); return; }
 
   // まず待ち行列に載せる。ここで失敗しても項目は消えないし、あとから必ず送り直せる。
+  // 「送信済み（未確認）」を送り直すときは前と同じ番号で送る。前の分が届いていれば、
+  // 気になり帳は二重に登録せず「もう入っている」と返す（確認できたことになる）
   const before = item.kn || 0;
-  const added = await enqueueClip(itemId);
+  const reuse = item.kn && !item.knc && item.knk ? item.knk : '';
+  const added = await enqueueClip(itemId, { nonce: reuse });
   if (added && added.refused) {
     sendResponse({ ok: false, status: 'full', message: '未送信が多すぎます。先に「今すぐ送る」で片付けてください。' });
     return;
@@ -128,18 +137,18 @@ async function sendToKininari(itemId, sendResponse) {
   // 「待ち行列に無い＝送れた」ではなく、項目に印が付いたかどうかで判断する
   const after = (await getAll()).items.find(i => i.id === itemId);
   if (after && (after.kn || 0) > before) {
-    sendResponse({
-      ok: true,
-      status: after.knc ? 'saved' : 'blind',
-      message: after.knc ? CLIP_MESSAGE.saved : CLIP_MESSAGE.blind
-    });
+    const st = (res.results && res.results[itemId]) || (after.knc ? 'saved' : 'blind');
+    sendResponse({ ok: true, status: st, message: CLIP_MESSAGE[st] || (after.knc ? CLIP_MESSAGE.saved : CLIP_MESSAGE.blind) });
     return;
   }
   const stillQueued = (await queueSummary()).entries.find(e => e.id === itemId);
+  const why = stillQueued && stillQueued.status;
   sendResponse({
     ok: false,
-    status: (stillQueued && stillQueued.status) || 'failed',
-    message: '送れませんでした。あとで自動で送り直します（設定から今すぐ送ることもできます）',
+    status: why || 'failed',
+    // 容量不足・形式エラーは待っても直らないので、自動では送り直さない（理由をそのまま出す）
+    message: (why === 'quota' || why === 'parse') ? CLIP_MESSAGE[why]
+      : '送れませんでした。あとで自動で送り直します（設定から今すぐ送ることもできます）',
     err: (stillQueued && stillQueued.err) || '',
     left: res.left
   });
@@ -170,10 +179,26 @@ async function onClipConfigMaybeChanged() {
   await flushClips();
 }
 
+/**
+ * 項目・削除の記録・カテゴリが変わったら、1分ほどあとに Google ドライブへ送る。
+ * 続けて変わっても予約は1つだけ（無いときだけ作る）なので、まとめて1回で送られる。
+ */
+async function scheduleDriveSync() {
+  try {
+    if (!(await getMeta()).s.driveOn) return;
+    if (await chrome.alarms.get(DRIVE_ALARM)) return;
+    await chrome.alarms.create(DRIVE_ALARM, { delayInMinutes: 1 });
+  } catch { /* 30分ごとの確認で送られる */ }
+}
+
 let refreshTimer = null;
 chrome.storage.onChanged.addListener((changes, areaName) => {
   const keys = Object.keys(changes);
   const touched = keys.some(k => k.startsWith(ITEM_PREFIX) || k.startsWith(LOCAL_PREFIX));
+  if ((areaName === 'local' && keys.some(k => k.startsWith(LOCAL_PREFIX) || k.startsWith(RICH_PREFIX) || k === LOCAL_TOMBS_KEY))
+    || (areaName === 'sync' && (keys.includes(META_KEY) || keys.includes(WIPE_KEY)))) {
+    scheduleDriveSync();
+  }
   // 設定の変更は「再計算」より先に見る（下の早期 return に隠れないように）
   if (keys.includes(META_KEY)) onClipConfigMaybeChanged();
   // meta だけの変更（設定保存など）では再計算しない → 自分の書き込みで再入しない
@@ -235,10 +260,47 @@ function openLibrary(hash = '') {
 
 chrome.notifications.onClicked.addListener((id) => {
   if (id === NOTIF_ID) { openLibrary('#review'); chrome.notifications.clear(id); }
+  if (id === DRIVE_NOTIF_ID) { openLibrary('#drive'); chrome.notifications.clear(id); }
 });
 chrome.notifications.onButtonClicked.addListener((id) => {
   if (id === NOTIF_ID) { openLibrary('#review'); chrome.notifications.clear(id); }
+  if (id === DRIVE_NOTIF_ID) { openLibrary('#drive'); chrome.notifications.clear(id); }
 });
+
+/* ---------- Google ドライブ同期（裏で） ---------- */
+
+const DRIVE_NOTIF_ID = 'recall-drive';
+const DRIVE_ALERT_KEY = 'rcDriveAlert';   // local: 最後に「止まっています」と知らせた時刻
+
+/**
+ * 裏で同期する。許可切れなど、待っても直らない理由で止まったら通知で知らせる（1日1回まで）。
+ * うまくいったら控えを消す（次にまた止まったときにすぐ知らせられるように）。
+ */
+async function syncDriveInBackground() {
+  const r = await syncDrive();
+  try {
+    if (r && r.ok) {
+      if ((await chrome.storage.local.get(DRIVE_ALERT_KEY))[DRIVE_ALERT_KEY]) {
+        await chrome.storage.local.remove(DRIVE_ALERT_KEY);
+        chrome.notifications.clear(DRIVE_NOTIF_ID);
+      }
+      return r;
+    }
+    const last = (await chrome.storage.local.get(DRIVE_ALERT_KEY))[DRIVE_ALERT_KEY] || 0;
+    const alert = driveAlertFor(r, last, Date.now());
+    if (!alert) return r;
+    await chrome.storage.local.set({ [DRIVE_ALERT_KEY]: Date.now() });   // 先に記録する（通知に失敗しても鳴り続けない）
+    chrome.notifications.create(DRIVE_NOTIF_ID, {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icons/icon128.png'),
+      title: alert.title,
+      message: alert.message,
+      buttons: [{ title: 'つなぎ直す' }],
+      priority: 1
+    });
+  } catch { /* 知らせられなくても、設定画面には理由が出ている */ }
+  return r;
+}
 
 /* ---------- 保存 ---------- */
 
@@ -310,12 +372,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // 「元に戻す」で戻した項目を、気になり帳へ送る順番待ちに並べ直す。
     // 待ち行列の書き換えは Service Worker の中で順番に行う（画面から直接書くと取り合いになる）
     (async () => {
-      for (const id of (Array.isArray(msg.ids) ? msg.ids : [])) await enqueueClip(id);
+      // 消す前の番号のまま並べ直す（消す前の送信が届いていたら、気になり帳が二重にしない）
+      const nonces = (msg.nonces && typeof msg.nonces === 'object') ? msg.nonces : {};
+      for (const id of (Array.isArray(msg.ids) ? msg.ids : [])) await enqueueClip(id, { nonce: nonces[id] });
       flushClips();
     })().then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
     return true;
   }
   if (msg && msg.type === 'openLibrary') { openLibrary(msg.hash || ''); sendResponse({ ok: true }); return false; }
+  // Google ドライブ同期（設定画面から）
+  if (msg && msg.type === 'driveStatus') { driveStatus().then(sendResponse); return true; }
+  if (msg && msg.type === 'driveConnect') { connectDrive().then(sendResponse); return true; }
+  if (msg && msg.type === 'driveSync') {
+    // soft … ライブラリを開いたときの取り込み（裏の同期と同じ扱い。止まっていれば通知する）
+    (msg.soft ? syncDriveInBackground() : syncDrive({ force: true })).then(sendResponse);
+    return true;
+  }
+  if (msg && msg.type === 'driveDisconnect') { disconnectDrive().then(sendResponse); return true; }
+  if (msg && msg.type === 'driveBackups') { listBackups().then(sendResponse); return true; }
+  if (msg && msg.type === 'driveBackupGet') { getBackup(msg.id).then(sendResponse); return true; }
   return false;
 });
 

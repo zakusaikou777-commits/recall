@@ -56,6 +56,9 @@ async function boot() {
   render();
   if (new URLSearchParams(location.search).get('welcome')) $('welcome').classList.remove('hidden');
   renderVersion();
+  maybeOpenDriveSettings();
+  // Google ドライブ同期中なら、開いたときに最新を取りに行く（届いた分はストレージの変更で描き直される）
+  if (meta.s.driveOn) ask({ type: 'driveSync', soft: true });
   await showUpdateNotice();
 
   chrome.storage.onChanged.addListener(async (_c, area) => {
@@ -82,9 +85,22 @@ function applyHash() {
     query = h.slice(2);
     const box = $('q');
     if (box) { box.value = query; $('qClear').classList.toggle('hidden', !query); }
+  } else if (h === 'drive') {                        // 「同期が止まっています」の通知から
+    view = 'all';
+    openDriveOnLoad = true;
   } else if (h) view = h;
   else view = 'all';
   pruneSelection();
+}
+
+let openDriveOnLoad = false;
+/** 通知から開いたときは、設定の「Google ドライブ同期」を開いて見せる */
+function maybeOpenDriveSettings() {
+  if (!openDriveOnLoad) return;
+  openDriveOnLoad = false;
+  try { history.replaceState(null, '', '#all'); } catch { /* 続行 */ }
+  if (!$('setDlg').open) openSettings();
+  $('gdStatus').scrollIntoView({ block: 'center' });
 }
 
 /** 表示されていない項目が選択に残らないようにする（見えない項目の一括削除を防ぐ） */
@@ -449,8 +465,10 @@ async function deleteItems(list) {
     // 気になり帳へ送る順番待ちだったものは、戻したときに並び直す
     //（消している間に待ち行列から外されると、戻しても二度と送られない）
     let queued = [];
-    try { const q = await getQueue(); queued = snap.filter(i => q.some(e => e.id === i.id)).map(i => i.id); }
-    catch { queued = []; }
+    try {
+      const q = await getQueue();
+      queued = snap.map(i => q.find(e => e.id === i.id)).filter(Boolean).map(e => ({ id: e.id, k: e.k || '' }));
+    } catch { queued = []; }
     if (!(await removeMany(snap.map(i => i.id)))) return false;
     const g = (undoFn && undoGroup) ? undoGroup : { items: [], rich: {}, queued: [] };
     for (const s of snap) if (!g.items.some(x => x.id === s.id)) g.items.push(s);
@@ -477,8 +495,10 @@ async function restoreGroup(g) {
   try { muteReload = true; res = await restoreItems(list, Object.keys(g.rich).length ? g.rich : undefined); }
   finally { muteReload = false; }
   if (!res || !res.ok) { alert((res && res.error) || '元に戻せませんでした'); return; }
-  const requeue = [...new Set(g.queued)].filter(id => !sent[id]);
-  if (requeue.length) chrome.runtime.sendMessage({ type: 'clipRequeue', ids: requeue });
+  const nonces = {};
+  for (const q of g.queued) if (q && q.id && q.k) nonces[q.id] = q.k;
+  const requeue = [...new Set(g.queued.map(q => q.id))].filter(id => !sent[id]);
+  if (requeue.length) chrome.runtime.sendMessage({ type: 'clipRequeue', ids: requeue, nonces });
   ({ items, meta, rich } = await getAll());
   chrome.runtime.sendMessage({ type: 'refresh' });
   render();
@@ -765,6 +785,9 @@ function openSettingsForm() {
   $('sKnCat').value = KN_CATEGORIES.includes(meta.s.knCat) ? meta.s.knCat : '調べる';
   refreshKnPerm();
   renderKnQueue();
+  renderDrive();
+  $('gdMsg').textContent = '';
+  $('gdBackupBox').open = false;
   $('sThumbs').checked = meta.s.thumbs !== false;
   $('sEmbed').checked = meta.s.embed !== false;
   $('sSync').checked = meta.s.sync !== false;
@@ -912,11 +935,18 @@ function exportCsv() {
 }
 
 async function importJson(file) {
+  let data;
+  try { data = JSON.parse(await file.text()); }
+  catch (e) { $('setMsg').textContent = '読み込みに失敗しました: ' + e.message; return; }
+  await importData(data, $('setMsg'));
+}
+
+/** 読み込み（JSON ファイルと、Google ドライブのバックアップの両方から使う）。結果は out に書く */
+async function importData(data, out) {
   try {
-    const data = JSON.parse(await file.text());
-    const incoming = Array.isArray(data.items) ? data.items : [];
+    const incoming = Array.isArray(data && data.items) ? data.items : [];
     let importNote = '', settingsNote = '';
-    if (!incoming.length) { $('setMsg').textContent = '読み込める項目がありませんでした。'; return; }
+    if (!incoming.length) { out.textContent = '読み込める項目がありませんでした。'; return; }
     let metaChanged = false, settingsTaken = false;
     if (data.meta && Array.isArray(data.meta.cats)) {
       // まだ何も保存していない（＝既定のカテゴリのまま）なら、書き出し元の名前と色をそのまま使う
@@ -982,19 +1012,129 @@ async function importJson(file) {
     if (settingsTaken) chrome.runtime.sendMessage({ type: 'refresh' });
     const skipNote = invalid ? `（URL が http:// / https:// でない ${invalid} 件は読み込みませんでした）` : '';
     const dupNote = dup ? `（すでに保存してある ${dup} 件は読み込みませんでした）` : '';
-    $('setMsg').textContent = (failure
+    out.textContent = (failure
       ? `${done} 件まで読み込んだところで中断しました: ${failure}`
       : (done ? `${done} 件を読み込みました。` : (dup ? '新しく読み込む項目はありませんでした。' : '読み込める項目がありませんでした。')))
       + dupNote + skipNote + importNote + settingsNote;
   } catch (e) {
-    $('setMsg').textContent = '読み込みに失敗しました: ' + e.message;
+    out.textContent = '読み込みに失敗しました: ' + e.message;
+  }
+}
+
+/* ---------- Google ドライブ同期 ---------- */
+
+/** Service Worker に頼む（届かなければ null） */
+function ask(msg) {
+  return new Promise(r => {
+    try { chrome.runtime.sendMessage(msg, x => r(chrome.runtime.lastError ? null : x)); }
+    catch { r(null); }
+  });
+}
+
+const fmtDateTime = (ts) => new Date(ts).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+/** 状態とボタンを出す */
+async function renderDrive() {
+  const box = $('gdStatus');
+  const st = await ask({ type: 'driveStatus' });
+  const s = (st && st.state) || {};
+  const head = document.createElement('b');
+  const text = document.createElement('span');
+  let cls = '';
+  if (!st) { head.textContent = '状態を読めませんでした'; }
+  else if (!st.ready) {
+    head.textContent = '準備がまだです。';
+    text.textContent = ' manifest.json に OAuth クライアント ID を書いてから使えます（README の「Google ドライブ同期の準備」を見てください）。';
+  }
+  else if (!st.on) { head.textContent = 'つないでいません。'; text.textContent = ' つなぐと、この PC の全件をドライブに置き、ほかの PC と同期します。'; }
+  else if (s.err) { cls = ' err'; head.textContent = '同期できていません。'; text.textContent = ' ' + (s.errMsg || ''); }
+  else {
+    cls = ' on';
+    head.textContent = '同期しています。';
+    text.textContent = s.at ? ` 最後の同期: ${fmtDateTime(s.at)}・ドライブに ${s.total ?? '—'} 件` : ' まだ同期していません。';
+  }
+  box.className = 'drivestatus' + cls;
+  box.replaceChildren(head, text);
+  const ready = !!(st && st.ready), on = !!(st && st.on);
+  const needAuth = on && ['auth', 'denied', 'signin', 'clientid'].includes(s.err);
+  $('gdConnect').classList.toggle('hidden', on && !needAuth);
+  $('gdConnect').textContent = needAuth ? 'つなぎ直す' : 'Google ドライブにつなぐ';
+  $('gdConnect').disabled = !ready;
+  $('gdSync').classList.toggle('hidden', !on);
+  $('gdDisconnect').classList.toggle('hidden', !on);
+  $('gdBackupBox').classList.toggle('hidden', !on);
+}
+
+/** ボタンを押している間はほかのボタンを止める（二重に頼まない） */
+async function driveAction(busyText, fn) {
+  const ids = ['gdConnect', 'gdSync', 'gdDisconnect'];
+  if (ids.some(id => $(id).dataset.busy)) return;
+  for (const id of ids) { $(id).dataset.busy = '1'; $(id).disabled = true; }
+  $('gdMsg').textContent = busyText;
+  try { await fn(); }
+  finally {
+    for (const id of ids) { delete $(id).dataset.busy; $(id).disabled = false; }
+    await renderDrive();
+  }
+}
+
+function driveResultText(res) {
+  if (!res) return '結果を受け取れませんでした。';
+  if (!res.ok) return res.message || '同期できませんでした。';
+  if (res.skipped) return `変わったところはありませんでした（${res.total} 件）。`;
+  const bits = [];
+  if (res.put) bits.push(`ドライブから ${res.put} 件を取り込み`);
+  if (res.dropped) bits.push(`${res.dropped} 件をほかの PC での削除に合わせて削除`);
+  return `同期しました（${bits.length ? bits.join('・') + '・' : ''}全 ${res.total} 件）。`;
+}
+
+async function reloadAll() {
+  ({ items, meta, rich } = await getAll());
+  render();
+}
+
+/** ドライブに残っている日ごとのバックアップを並べる */
+async function renderDriveBackups() {
+  const list = $('gdBackups');
+  list.replaceChildren();
+  const res = await ask({ type: 'driveBackups' });
+  if (!res || !res.ok) {
+    const li = document.createElement('li');
+    li.textContent = (res && res.message) || 'バックアップの一覧を読めませんでした。';
+    list.appendChild(li);
+    return;
+  }
+  if (!res.backups.length) {
+    const li = document.createElement('li');
+    li.textContent = 'まだバックアップはありません（同期すると1日1回作られます）。';
+    list.appendChild(li);
+    return;
+  }
+  for (const b of res.backups) {
+    const li = document.createElement('li');
+    const label = document.createElement('span');
+    label.className = 'grow';
+    label.textContent = `${b.day}${b.size ? `（${Math.max(1, Math.round(b.size / 1024))}KB）` : ''}`;
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'btn sm'; btn.textContent = 'この日の状態から戻す';
+    btn.onclick = async () => {
+      btn.disabled = true;
+      $('gdMsg').textContent = `${b.day} のバックアップを読んでいます…`;
+      try {
+        const got = await ask({ type: 'driveBackupGet', id: b.id });
+        if (!got || !got.ok) { $('gdMsg').textContent = (got && got.message) || 'バックアップを読めませんでした。'; return; }
+        await importData(got.data, $('gdMsg'));
+      } finally { btn.disabled = false; }
+    };
+    li.append(label, btn);
+    list.appendChild(li);
   }
 }
 
 /* ---------- イベント ---------- */
 
 function bind() {
-  window.addEventListener('hashchange', () => { applyHash(); render(); });
+  window.addEventListener('hashchange', () => { applyHash(); render(); maybeOpenDriveSettings(); });
 
   $('q').addEventListener('input', () => {
     query = $('q').value.trim();
@@ -1169,13 +1309,35 @@ function bind() {
     }
   });
 
+  // Google ドライブ同期
+  $('gdConnect').addEventListener('click', () => driveAction('Google の許可の画面を開いています…', async () => {
+    const res = await ask({ type: 'driveConnect' });
+    $('gdMsg').textContent = res && res.ok ? 'つなぎました。' + driveResultText(res) : driveResultText(res);
+    await reloadAll();
+  }));
+  $('gdSync').addEventListener('click', () => driveAction('同期しています…', async () => {
+    $('gdMsg').textContent = driveResultText(await ask({ type: 'driveSync' }));
+    await reloadAll();
+  }));
+  $('gdDisconnect').addEventListener('click', () => {
+    if (!confirm('Google ドライブ同期をやめます（つないでいるほかの PC も止まります）。\nドライブに置いたデータは消えません。またつなげば、続きから同期します。よろしいですか？')) return;
+    driveAction('止めています…', async () => {
+      const res = await ask({ type: 'driveDisconnect' });
+      $('gdMsg').textContent = res && res.ok ? 'Google ドライブ同期をやめました。' : '止められませんでした。';
+      ({ items, meta, rich } = await getAll());
+    });
+  });
+  $('gdBackupBox').addEventListener('toggle', () => { if ($('gdBackupBox').open) renderDriveBackups(); });
+
   $('expJson').onclick = exportJson;
   $('expCsv').onclick = exportCsv;
   $('impBtn').onclick = () => $('impFile').click();
   $('impFile').addEventListener('change', e => { if (e.target.files[0]) importJson(e.target.files[0]); e.target.value = ''; });
   $('wipe').onclick = async () => {
     // 同期オンなら、ほかの PC からも消える。同期オフならこの端末の項目だけ（wipeAll と同じ分け方）
-    const first = meta.s.sync !== false
+    const first = meta.s.driveOn
+      ? '保存したページと設定をすべて削除します。\n同期している ほかの PC と Google ドライブからも消えます（ドライブの日ごとのバックアップは残るので、そこから戻せます）。よろしいですか？'
+      : meta.s.sync !== false
       ? '保存したページと設定をすべて削除します。\n同期している ほかの PC からも消えます。元に戻せません。よろしいですか？'
       : 'この端末に保存したページをすべて削除します（同期はオフなので、ほかの PC の項目と設定はそのまま残ります）。元に戻せません。よろしいですか？';
     if (!confirm(first)) return;
