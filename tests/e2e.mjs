@@ -464,6 +464,7 @@ eq2('URLが送られる', sent && sent.u, 'https://www.youtube.com/watch?v=knTes
 ok('メモが送られる', sent && sent.n.includes('気になり帳へ送るメモ'));
 ok('タグが本文に付く', sent && sent.n.includes('#テストタグ'));
 eq2('Recall のカテゴリがフォルダになる', sent && sent.f, '技術');
+eq2('Recall から来た印を付ける（気になり帳が分類の控えを持つ）', sent && sent.src, 'recall');
 eq2('気になり帳のカテゴリが入る', sent && sent.c, '調べる');
 ok('YouTube のサムネイルURLが付く', sent && /i\.ytimg\.com\/vi\/knTestVid01/.test(sent.img));
 ok('タグを項目として送る', sent && Array.isArray(sent.tags) && sent.tags.includes('テストタグ'));
@@ -1350,34 +1351,28 @@ await lib.evaluate(async () => {
   await chrome.storage.sync.set({ meta: { ...m, s: { ...m.s, driveOn: false } } });
 });
 
-section('1.9.0: 気になり帳のフォルダを取り込む');
+section('1.11.0: 気になり帳と合わせる（設定のボタン）');
+// 実際に合わせる動き（気になり帳のタブ・iframe・裏タブ・自動のきっかけ）は tests/e2e-kn-sync.mjs で、
+// テスト用の気になり帳へのサイト権限を付けた拡張機能で確かめる。ここは権限の無いふつうの状態
 await freshStore();
 await openLib('all');
 await lib.click('#btnSettings'); await lib.waitForTimeout(800);
+ok('ボタンの名前が「気になり帳と合わせる」', (await lib.locator('#knSync').innerText()).includes('気になり帳と合わせる'));
+const knSyncHelp = await lib.locator('.catfromkn').innerText();
+ok('何が伝わり、何が伝わらないかを書いてある', knSyncHelp.includes('削除と名前の変更は伝わりません') && knSyncHelp.includes('Recall のカテゴリは変わりません'));
+const syncMsg = () => lib.locator('#knSyncMsg').innerText();
+const syncDone = async () => { const t = (await syncMsg()).trim(); return !!t && !t.endsWith('…'); };
+await lib.fill('#sKnUrl', '');
+await lib.click('#knSync');
+await waitUntil(syncDone, 8000);
+ok('URL が無ければ入れる場所を伝える', (await syncMsg()).includes('URL が未設定'));
 await lib.fill('#sKnUrl', 'https://kn-e2e.example/app/');
-const catMsg = () => lib.locator('#catFromKnMsg').innerText();
-const catDone = async () => { const t = (await catMsg()).trim(); return !!t && !t.endsWith('…'); };
-await lib.click('#catFromKn');
-await waitUntil(catDone, 8000);
-ok('許可が無ければ「保存の確認を許可する」を求める', (await catMsg()).includes('保存の確認を許可する'));
-// 許可済みで、気になり帳のタブが開いている状態にする（中身は気になり帳と同じ形）
-await lib.evaluate((data) => {
-  chrome.permissions.contains = async () => true;
-  chrome.tabs.query = async () => [{ id: 424242, status: 'complete', url: 'https://kn-e2e.example/app/' }];
-  chrome.scripting.executeScript = async () => [{ result: JSON.stringify(data) }];
-}, { memos: [], notebooks: [{ id: 'a', name: '未分類' }, { id: 'b', name: 'オレンジカード', color: '#3E6CA3' }, { id: 'c', name: '株主優待' }] });
-await lib.click('#catFromKn');
-await waitUntil(catDone, 8000);
-ok('足りないフォルダをカテゴリに足す', (await catMsg()).includes('2 件のフォルダをカテゴリに足しました'));
-const catNamesNow = await lib.evaluate(async () => (await chrome.storage.sync.get('meta')).meta.cats.map(c => c.name));
-ok('カテゴリとして保存される', catNamesNow.includes('オレンジカード') && catNamesNow.includes('株主優待'));
-eq2('同じ名前（未分類）は二重にならない', catNamesNow.filter(n => n === '未分類').length, 1);
-ok('カテゴリの管理にも出る', (await lib.locator('#catEditor input[type=text]').evaluateAll(els => els.map(e => e.value))).includes('株主優待'));
-await lib.click('#catFromKn');
-await waitUntil(async () => (await catMsg()).includes('すべて'), 8000);
-ok('2回押しても増えない', (await catMsg()).includes('すべて Recall のカテゴリにあります'));
+const pagesBeforeSync = ctx.pages().length;
+await lib.click('#knSync');
+await waitUntil(syncDone, 8000);
+ok('許可が無ければ「保存の確認を許可する」を求める', (await syncMsg()).includes('保存の確認を許可する'));
+eq2('許可が無ければタブを開かない', ctx.pages().length, pagesBeforeSync);
 await lib.locator('#setDlg button[value=close]').click(); await lib.waitForTimeout(1200);
-ok('サイドバーのカテゴリにも出る', (await lib.locator('#catList').innerText()).includes('株主優待'));
 
 section('後片付け');
 const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));

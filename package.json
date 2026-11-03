@@ -1,6 +1,6 @@
 {
   "name": "recall-extension",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "private": true,
   "type": "module",
   "description": "Recall — 復習ブックマーク（Chrome 拡張機能）のテスト環境",
@@ -8,7 +8,8 @@
     "test": "node tests/run-all.mjs",
     "check": "node tests/check.mjs",
     "test:unit": "node tests/unit.mjs",
-    "test:e2e": "node tests/e2e.mjs",
+    "test:e2e": "node tests/e2e.mjs && node tests/e2e-kn-sync.mjs",
+    "test:kn-sync": "node tests/e2e-kn-sync.mjs",
     "setup:browser": "playwright install chromium",
     "sync:readme": "node tests/sync-readme.mjs"
   },

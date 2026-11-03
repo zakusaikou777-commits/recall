@@ -12,7 +12,7 @@ import {
 import { CHANGELOG, currentVersion, entryFor } from './changelog.js';
 import {
   KN_CATEGORIES, originOf, clipEnabled, MAX_TRIES, getQueue, takeSentWhileGone,
-  readKininariFolders, mergeFolderCats, CAT_NAME_MAX
+  knSyncMessage, getKnSyncState, KN_SYNC_KEY
 } from './kininari.js';
 
 const $ = (id) => document.getElementById(id);
@@ -67,6 +67,8 @@ async function boot() {
   chrome.storage.onChanged.addListener(async (_c, area) => {
     if ((area !== 'sync' && area !== 'local') || muteReload) return;
     if (Object.keys(_c).every(k => k === 'lastNotified')) return;
+    // 気になり帳と合わせた記録だけが変わったときは、一覧は描き直さない（設定を開いていれば状態だけ更新）
+    if (Object.keys(_c).every(k => k === 'lastNotified' || k === KN_SYNC_KEY)) { if ($('setDlg').open) renderKnSyncState(); return; }
     ({ items, meta, rich } = await getAll());
     // 埋め込み動画を見ている最中に作り直すと再生が止まるので、そのときは描き直さない
     if (document.querySelector('.thumb.playing')) { renderUsage(); return; }
@@ -790,7 +792,8 @@ function openSettingsForm() {
   renderKnQueue();
   renderDrive();
   $('gdMsg').textContent = '';
-  $('catFromKnMsg').textContent = '';
+  $('knSyncMsg').textContent = '';
+  renderKnSyncState();
   $('gdBackupBox').open = false;
   $('sThumbs').checked = meta.s.thumbs !== false;
   $('sEmbed').checked = meta.s.embed !== false;
@@ -806,6 +809,15 @@ function openSettingsForm() {
   fillCatSelect($('sCat'), meta.s.defaultCat);
   fillIvSelect($('sIv'), meta.s.defaultInterval);
   renderCatEditor();
+}
+
+/** 気になり帳と最後に合わせたとき・まだ届いていない変更があるかを出す */
+async function renderKnSyncState() {
+  const st = await getKnSyncState();
+  const parts = [];
+  if (st.lastOk) parts.push(`最後に合わせたのは ${fmtDateTime(st.lastOk)} です。`);
+  if (st.pendingAt) parts.push('まだ気になり帳に届いていない分類の変更があります（気になり帳を開くと自動で合わせます）。');
+  $('knSyncState').textContent = parts.join('');
 }
 
 /** 「保存の確認」用のホスト権限の状態を出す */
@@ -1333,33 +1345,29 @@ function bind() {
   });
   $('gdBackupBox').addEventListener('toggle', () => { if ($('gdBackupBox').open) renderDriveBackups(); });
 
-  // 気になり帳のフォルダを、Recall のカテゴリに取り込む（足すだけ。消したり名前を変えたりはしない）
-  $('catFromKn').addEventListener('click', async () => {
-    const btn = $('catFromKn'), out = $('catFromKnMsg');
+  // 気になり帳と今すぐ合わせる（分類は Recall に合わせ、フォルダとカテゴリはお互いに足りない分を足す）。
+  // 自動の回と取り合わないよう、合わせる処理は Service Worker で動かす
+  $('knSync').addEventListener('click', async () => {
+    const btn = $('knSync'), out = $('knSyncMsg');
     if (btn.disabled) return;
     // 設定は閉じたときに保存されるので、入力中の URL を優先する
     const knUrl = clip($('sKnUrl').value, 300).trim() || meta.s.knUrl;
     btn.disabled = true;
-    out.textContent = '気になり帳のフォルダを読んでいます…';
+    out.textContent = '気になり帳と合わせています…';
     try {
-      const res = await readKininariFolders(knUrl);
-      if (!res.ok) { out.textContent = res.message; return; }
-      if (!res.folders.length) { out.textContent = '気になり帳にフォルダがありません。'; return; }
-      const r = mergeFolderCats(meta.cats, res.folders, () => 'c' + newId());
-      if (r.added.length) {
-        meta.cats = r.cats;
-        if (!(await saveMeta())) { out.textContent = 'カテゴリを保存できませんでした。'; return; }
+      const res = await ask({ type: 'knSync', knUrl });
+      out.textContent = knSyncMessage(res);
+      if (res && res.added && res.added.length) {
+        // 足したカテゴリを読み直す（古い meta のまま閉じると、設定の保存で足した分を消してしまう）
+        ({ items, meta, rich } = await getAll());
         renderCatEditor();
         fillCatSelect($('sCat'), $('sCat').value);
         render();
       }
-      const long = r.tooLong.length
-        ? `名前が長い ${r.tooLong.length} 件（${r.tooLong.map(n => clip(n, 16)).join('・')}）は取り込めませんでした（カテゴリ名は${CAT_NAME_MAX}文字まで）。`
-        : '';
-      out.textContent = (r.added.length
-        ? `${r.added.length} 件のフォルダをカテゴリに足しました（${r.added.join('・')}）。` + (r.same ? `すでにある ${r.same} 件はそのままです。` : '')
-        : '気になり帳のフォルダは、すべて Recall のカテゴリにあります。') + long;
-    } finally { btn.disabled = false; }
+    } finally {
+      btn.disabled = false;
+      renderKnSyncState();
+    }
   });
 
   $('expJson').onclick = exportJson;

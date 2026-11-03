@@ -70,9 +70,15 @@ const fakeBrowser = {
   tabStatus: undefined,      // tabs.get が返す読み込み状態（'complete' など）
   queryTabs: null,           // tabs.query が返すタブ（開いているタブ）
   removed: [],               // 閉じたタブ
+  // 気になり帳と合わせる（window.__kininariRecall）。null なら受け口の無い気になり帳（古い版・まだ読み込み中）
+  knApi: null,               // (payload, tabId) => result
+  knFrame: 0,                // 受け口のあるフレーム（0 = ページ本体。結合アプリでは iframe の中）
+  knCalls: [],               // apply を呼んだ記録 { tabId, payload }
+  knProbes: 0,               // 受け口を探しに行った回数
   reset() {
     this.createFails = false; this.hasPermission = true; this.savedFlag = true; this.reply = undefined; this.tabs.clear();
     this.created = []; this.attempts = 0; this.onCreate = null; this.tabStatus = undefined; this.queryTabs = null; this.removed = [];
+    this.knApi = null; this.knFrame = 0; this.knCalls = []; this.knProbes = 0;
   }
 };
 const sessionMem = {};
@@ -92,6 +98,19 @@ globalThis.chrome = {
   },
   scripting: {
     executeScript: async (opts) => {
+      if (opts && opts.func && opts.func.name === 'runKininariApply') {
+        // 全フレームに送られる。受け口のあるフレームだけが apply を呼んで返事をする
+        fakeBrowser.knProbes++;
+        const tabId = opts.target && opts.target.tabId;
+        if (!fakeBrowser.tabs.has(tabId)) throw new Error('No tab with id: ' + tabId);
+        const frames = [0, 3].map(frameId => ({ frameId, result: { found: false } }));
+        if (fakeBrowser.knApi) {
+          fakeBrowser.knCalls.push({ tabId, payload: structuredClone(opts.args[0]) });
+          const result = await fakeBrowser.knApi(opts.args[0], tabId);
+          frames.find(f => f.frameId === fakeBrowser.knFrame).result = { found: true, result };
+        }
+        return frames;
+      }
       if (opts && opts.world === 'MAIN') return [{ result: fakeBrowser.reply !== undefined ? fakeBrowser.reply : fakeBrowser.savedFlag }];
       if (scriptingResult instanceof Error) throw scriptingResult;
       return [{ result: scriptingResult }];
@@ -108,7 +127,10 @@ globalThis.chrome = {
       fakeBrowser.created.push(url);
       return { id, url };
     },
-    get: async (id) => { if (!fakeBrowser.tabs.has(id)) throw new Error('no tab'); return fakeBrowser.tabStatus ? { id, status: fakeBrowser.tabStatus } : { id }; },
+    get: async (id) => {
+      if (!fakeBrowser.tabs.has(id)) throw new Error('no tab');
+      return fakeBrowser.tabStatus ? { id, status: fakeBrowser.tabStatus, url: fakeBrowser.tabs.get(id) } : { id, url: fakeBrowser.tabs.get(id) };
+    },
     remove: (id, cb) => { fakeBrowser.tabs.delete(id); fakeBrowser.removed.push(id); if (cb) cb(); },
     query: async () => fakeBrowser.queryTabs || []
   },
@@ -1484,6 +1506,304 @@ eq('気になり帳のデータが無いとき', rf.reason, 'nodata');
 ok('そのときもタブは閉じる', fakeBrowser.tabs.size === 0);
 scriptingResult = {};
 fakeBrowser.reset();
+
+/* ---------- 1.11.0: 気になり帳と合わせる ---------- */
+console.log('\n--- 1.11.0: 気になり帳へ送るフォルダ（未分類＝フォルダなし） ---');
+eq('Recall から来た印を付けて送る', decoded.src, 'recall');
+const c0Clip = (it) => JSON.parse(decodeURIComponent(KN.buildClipUrl(knMeta.s.knUrl, KN.clipFieldsFor(it, knMeta, null)).url.split('#knadd=')[1]));
+eq('未分類（c0）は f を空で送る（気になり帳の「フォルダなし」）', c0Clip(S.makeItem({ u: 'https://a.example/c0', t: 'c0', c: 'c0' }, knMeta)).f, '');
+eq('消えたカテゴリも f を空で送る', c0Clip({ ...S.makeItem({ u: 'https://a.example/gone', t: 'gone' }, knMeta), c: 'cGone' }).f, '');
+eq('未分類でも src は付く', c0Clip(S.makeItem({ u: 'https://a.example/c0', t: 'c0', c: 'c0' }, knMeta)).src, 'recall');
+eq('未分類の名前を変えていても「フォルダなし」', KN.knFolderName({ id: 'c0', name: 'あとで見る' }), '');
+eq('名前が「未分類」のカテゴリも「フォルダなし」（気になり帳もそう読む）', KN.knFolderName({ id: 'c7', name: ' 未分類 ' }), '');
+eq('フォルダ名は前後の空白を除く', KN.knFolderName({ id: 'c7', name: ' 学習 ' }), '学習');
+eq('カテゴリが無ければ「フォルダなし」', KN.knFolderName(undefined), '');
+
+console.log('\n--- 1.11.0: 気になり帳と合わせる（渡す中身） ---');
+const syncMeta = { ...structuredClone(S.DEFAULT_META), cats: [
+  { id: 'c0', name: '未分類', color: '#94a3b8' }, { id: 'c1', name: ' 学習 ', color: '#10b981' },
+  { id: 'c2', name: 'Game', color: 'red' }, { id: 'c3', name: 'game', color: '#111111' }, { id: 'c4', name: '未分類', color: '#000000' },
+  { id: 'c5', name: '', color: '#222222' }
+] };
+const sItems = [
+  { id: 'a', u: 'https://a.example/1', c: 'c1' },
+  { id: 'b', u: 'https://a.example/1/#frag', c: 'c2' },       // 同じページ（気になり帳は # と末尾の / を区別しない）
+  { id: 'c', u: 'https://b.example/2/', c: 'c0' },
+  { id: 'd', u: 'https://b.example/3', c: 'cGone' },
+  { id: 'e', u: 'ftp://x.example/', c: 'c1' },
+  { id: 'f', u: 'javascript:alert(1)', c: 'c1' },
+  { id: 'g', u: 'HTTP://C.example/Path?q=1', c: 'c3' },
+  null, { id: 'h' }
+];
+const sp = KN.buildSyncPayload(sItems, syncMeta);
+eq('版は 1', sp.v, 1);
+eq('カテゴリは未分類・空の名前を除き、名前を整える（大文字小文字だけの違いは1つ）', sp.cats.map(c => c.name), ['学習', 'Game']);
+eq('色は #rrggbb のものだけ', sp.cats.map(c => c.color), ['#10b981', '']);
+eq('http(s) の項目だけ・同じページは先の1件', sp.items.map(i => i.u), ['https://a.example/1', 'https://b.example/2/', 'https://b.example/3', 'HTTP://C.example/Path?q=1']);
+eq('f はフォルダ名（未分類・消えたカテゴリは ""）', sp.items.map(i => i.f), ['学習', '', '', 'game']);
+eq('中身が空でも形はそろう', KN.buildSyncPayload([], { cats: [] }), { v: 1, cats: [], items: [] });
+eq('meta が壊れていても落ちない', KN.buildSyncPayload(null, null), { v: 1, cats: [], items: [] });
+eq('重複の見分け方は気になり帳と同じ（# と末尾の / を除く）', [KN.knUrlKey('https://a.example/x/#y'), KN.knUrlKey(' https://a.example/x '), KN.knUrlKey('')], ['https://a.example/x', 'https://a.example/x', '']);
+
+const sig1 = KN.payloadSig(sp, 'https://kn.example/*');
+eq('同じ中身なら指紋も同じ', KN.payloadSig(structuredClone(sp), 'https://kn.example/*'), sig1);
+ok('カテゴリが変われば指紋も変わる', KN.payloadSig({ ...sp, items: sp.items.map((x, i) => (i ? x : { ...x, f: 'Game' })) }, 'https://kn.example/*') !== sig1);
+ok('保存先が変われば指紋も変わる', KN.payloadSig(sp, 'https://kn2.example/*') !== sig1);
+
+console.log('\n--- 1.11.0: 気になり帳の返事を取り込む ---');
+const kres = { ok: true, v: 1, moved: 2, created: ['学習'], removed: ['未分類'], folders: [
+  { name: ' 株主優待 ', color: '#3E6CA3', parent: null }, { name: '未分類', color: '#C0463C', parent: null }, { name: '' },
+  { name: '株主優待', color: '#000000' }, null, 5, { name: 3 }, { name: '攻略メモ', color: 'blue', parent: 'ゲーム' },
+  { name: '学習', color: '#C98A1B', parent: null }, { name: 'GAME', color: '#57845A', parent: null },
+  { name: 'とても長い名前のフォルダでカテゴリ名の上限を超えている', color: '', parent: null }
+] };
+const kfs = KN.foldersFromSyncResult(kres);
+eq('フォルダを読む（未分類・空・同じ名前・壊れたものは除く。入れ子も平らに）', kfs.map(f => f.name), ['株主優待', '攻略メモ', '学習', 'GAME', 'とても長い名前のフォルダでカテゴリ名の上限を超えている']);
+eq('色は #rrggbb のものだけ', kfs.map(f => f.color).slice(0, 2), ['#3E6CA3', '']);
+eq('folders が無い返事は空', [KN.foldersFromSyncResult({ ok: true }), KN.foldersFromSyncResult(null), KN.foldersFromSyncResult({ folders: 'x' })], [[], [], []]);
+let sfid = 0;
+const smerged = KN.mergeFolderCats(syncMeta.cats, kfs, () => 'cS' + (++sfid));
+eq('Recall に無いフォルダだけカテゴリに足す（大文字小文字の違いは同じ名前）', smerged.added, ['株主優待', '攻略メモ']);
+eq('長すぎる名前は足さない', smerged.tooLong.length, 1);
+eq('もとのカテゴリはそのまま', smerged.cats.slice(0, syncMeta.cats.length), syncMeta.cats);
+eq('足したカテゴリは気になり帳の色', smerged.cats.find(c => c.name === '株主優待').color, '#3E6CA3');
+
+eq('どのフレームにも受け口が無ければ null', KN.pickApplyResult([{ frameId: 0, result: { found: false } }, { frameId: 2, result: null }, null]), null);
+eq('結合アプリ（iframe の中）の返事を選ぶ', KN.pickApplyResult([{ frameId: 0, result: { found: false } }, { frameId: 4, result: { found: true, result: { ok: true, moved: 1 } } }]), { ok: true, moved: 1 });
+eq('失敗の返事もそのまま伝える', KN.pickApplyResult([{ result: { found: true, result: { ok: false, error: 'x' } } }]), { ok: false, error: 'x' });
+eq('返事が空なら失敗', KN.pickApplyResult([{ result: { found: true, result: null } }]).ok, false);
+eq('executeScript が失敗したら null', KN.pickApplyResult(null), null);
+
+console.log('\n--- 1.11.0: いつ合わせるか ---');
+const ri = { id: 'a', u: 'https://a.example/', c: 'c1', b: 0, s: 0, n: '' };
+ok('カテゴリが変わったら合わせる', KN.knSyncRelevant({ 'L:a': { oldValue: ri, newValue: { ...ri, c: 'c2' } } }, 'local'));
+ok('URL が変わったら合わせる', KN.knSyncRelevant({ 'L:a': { oldValue: ri, newValue: { ...ri, u: 'https://a.example/2' } } }, 'local'));
+ok('復習の結果・メモの編集だけなら合わせない', !KN.knSyncRelevant({ 'L:a': { oldValue: ri, newValue: { ...ri, b: 1, s: 1, n: 'メモ' } } }, 'local'));
+ok('項目の追加・削除では合わせない（追加は送るときにフォルダ付きで届く）',
+  !KN.knSyncRelevant({ 'L:a': { newValue: ri } }, 'local') && !KN.knSyncRelevant({ 'L:a': { oldValue: ri } }, 'local'));
+ok('付随情報・送信待ち・合わせた記録では合わせない', !KN.knSyncRelevant({
+  'R:a': { oldValue: { th: '' }, newValue: { th: 'x' } }, rcClipQueue: { oldValue: [], newValue: [{ id: 'a' }] },
+  [KN.KN_SYNC_KEY]: { oldValue: {}, newValue: { pendingAt: 1 } } }, 'local'));
+ok('同期（i:）の項目は見ない（取り込まれると local の変更として来る）', !KN.knSyncRelevant({ 'i:a': { oldValue: ri, newValue: { ...ri, c: 'c2' } } }, 'sync'));
+const rm = { cats: [{ id: 'c0', name: '未分類', color: '#000' }, { id: 'c1', name: '学習', color: '#111' }], s: { knOn: true, knUrl: 'https://kn.example/' } };
+ok('カテゴリを足したら合わせる', KN.knSyncRelevant({ meta: { oldValue: rm, newValue: { ...rm, cats: [...rm.cats, { id: 'c9', name: '料理' }] } } }, 'sync'));
+ok('カテゴリの名前を変えたら合わせる', KN.knSyncRelevant({ meta: { oldValue: rm, newValue: { ...rm, cats: [rm.cats[0], { ...rm.cats[1], name: '勉強' }] } } }, 'sync'));
+ok('色だけなら合わせない（気になり帳のフォルダの色は作るときだけ）', !KN.knSyncRelevant({ meta: { oldValue: rm, newValue: { ...rm, cats: [rm.cats[0], { ...rm.cats[1], color: '#fff' }] } } }, 'sync'));
+ok('設定を閉じただけ（中身が同じ）なら合わせない', !KN.knSyncRelevant({ meta: { oldValue: rm, newValue: structuredClone(rm) } }, 'sync'));
+ok('送信をオンにした・保存先を変えたら合わせる', KN.knSyncRelevant({ meta: { oldValue: { ...rm, s: { knOn: false, knUrl: '' } }, newValue: rm } }, 'sync'));
+ok('meta が初めて書かれたとき（前が無い）も落ちない', KN.knSyncRelevant({ meta: { newValue: rm } }, 'sync'));
+ok('ほかの領域は見ない', !KN.knSyncRelevant({ meta: { oldValue: rm, newValue: { ...rm, cats: [] } } }, 'session') && !KN.knSyncRelevant(null, 'local'));
+
+const T0 = 1_800_000_000_000;
+ok('一度も合わせていなければ、開いたときに合わせる', KN.knSyncDueOnLoad({}, T0));
+ok('まだ届いていない変更があれば合わせる', KN.knSyncDueOnLoad({ lastOk: T0 - 1000, pendingAt: T0 - 500 }, T0));
+ok('30分以内に合わせていれば見送る', !KN.knSyncDueOnLoad({ lastOk: T0 - 29 * 60000, pendingAt: 0 }, T0));
+ok('30分たっていれば合わせる（スマホで足したフォルダを取り込む）', KN.knSyncDueOnLoad({ lastOk: T0 - 30 * 60000 }, T0));
+
+const korg = 'https://kn.example/*';
+ok('同じサイトの読み終えたタブを使う（結合アプリ index.html でも）', KN.knTabUsable({ id: 1, url: 'https://kn.example/app/index.html', status: 'complete' }, korg));
+ok('送信用の裏タブ（#knadd=）は使わない', !KN.knTabUsable({ id: 1, url: 'https://kn.example/app/kininari.html#knadd=%7B%7D', status: 'complete' }, korg));
+ok('読み込み中のタブは使わない（読み終えたときに合わせる）', !KN.knTabUsable({ id: 1, url: 'https://kn.example/', status: 'loading' }, korg));
+ok('読み終えた知らせを受けたタブなら状態は問わない', KN.knTabUsable({ id: 1, url: 'https://kn.example/', status: 'loading' }, korg, false));
+ok('ほかのサイトのタブは使わない', !KN.knTabUsable({ id: 1, url: 'https://kn.example.evil.test/', status: 'complete' }, korg));
+ok('眠らせたタブは使わない', !KN.knTabUsable({ id: 1, url: 'https://kn.example/', status: 'complete', discarded: true }, korg));
+
+console.log('\n--- 1.11.0: 結果の知らせ方 ---');
+ok('動かした数・作ったフォルダ・足したカテゴリを伝える', (() => {
+  const t = KN.knSyncMessage({ ok: true, moved: 3, created: ['学習', '仕事'], added: ['株主優待'], removed: ['未分類'], tooLong: [] });
+  return t.includes('メモ 3 件') && t.includes('フォルダを 2 件作りました（学習・仕事）') && t.includes('カテゴリに足しました（株主優待）') && t.includes('「未分類」');
+})());
+ok('何も変わらなければそう伝える', KN.knSyncMessage({ ok: true, moved: 0, created: [], added: [] }).includes('変わったところはありません'));
+ok('許可が無ければ押すボタンを伝える', KN.knSyncMessage({ ok: false, reason: 'perm' }).includes('保存の確認を許可する'));
+ok('気になり帳が古ければそう伝える', KN.knSyncMessage({ ok: false, reason: 'noapi' }).includes('新しい版'));
+ok('気になり帳の失敗の理由も出す', KN.knSyncMessage({ ok: false, reason: 'failed', error: '保存できません' }).includes('保存できません'));
+ok('古い気になり帳ではフォルダの取り込みだけしたと伝える', (() => {
+  const t = KN.knSyncMessage({ ok: true, old: true, added: ['株主優待'], tooLong: ['x'.repeat(30)] });
+  return t.includes('古い版') && t.includes('取り込みだけ') && t.includes('株主優待') && t.includes('20文字まで');
+})());
+ok('返事が無いとき', KN.knSyncMessage(null).includes('受け取れません'));
+
+console.log('\n--- 1.11.0: 気になり帳と合わせる（動き） ---');
+const KW = { ...KN.KN_SYNC_WAIT };
+Object.assign(KN.KN_SYNC_WAIT, { api: 1500, probe: 300, poll: 50, load: 1000, apply: 1000 });
+fakeBrowser.reset();
+const ksMeta = { ...structuredClone(S.DEFAULT_META),
+  cats: [{ id: 'c0', name: '未分類', color: '#94a3b8' }, { id: 'c1', name: '学習', color: '#10b981' }, { id: 'c4', name: '技術', color: '#0ea5e9' }],
+  s: { ...S.DEFAULT_META.s, knOn: true, knUrl: 'https://kn.example/app/kininari.html', knCat: '調べる' } };
+await resetAll(ksMeta);
+const ksA = S.makeItem({ u: 'https://sync.example/a', t: 'A', c: 'c1' }, ksMeta);
+const ksB = S.makeItem({ u: 'https://sync.example/b', t: 'B', c: 'c0' }, ksMeta);
+await S.putItems([ksA, ksB]);
+const ksState = () => KN.getKnSyncState();
+const knTab = { id: 700, url: 'https://kn.example/app/index.html', status: 'complete' };
+const answer = (extra = {}) => (payload) => ({ ok: true, v: 1, moved: 1, created: [], removed: [],
+  folders: [{ name: '学習', color: '#10b981', parent: null }, { name: '株主優待', color: '#3E6CA3', parent: null }, { name: '未分類', color: '#C0463C', parent: null }], ...extra });
+
+fakeBrowser.hasPermission = false;
+let ks = await KN.syncKininari({ trigger: 'change' });
+eq('許可が無ければ合わせない（自動は黙って見送る）', [ks.ok, ks.reason, fakeBrowser.knProbes, fakeBrowser.attempts], [false, 'perm', 0, 0]);
+fakeBrowser.hasPermission = true;
+fakeBrowser.queryTabs = [];
+await KN.markKnSyncPending();
+ks = await KN.syncKininari({ trigger: 'change' });
+eq('気になり帳が開いていなければ、自分では開かない', [ks.reason, fakeBrowser.attempts, fakeBrowser.knProbes], ['notab', 0, 0]);
+ok('届いていない印は残る', (await ksState()).pendingAt > 0);
+
+fakeBrowser.queryTabs = [knTab, { id: 701, url: 'https://kn.example/app/kininari.html#knadd=x', status: 'complete' }, { id: 702, url: 'https://other.example/', status: 'complete' }];
+fakeBrowser.tabs.set(700, knTab.url); fakeBrowser.tabs.set(701, 'https://kn.example/app/kininari.html#knadd=x');
+fakeBrowser.knApi = answer({ moved: 1, created: ['技術'] });
+fakeBrowser.knFrame = 3;                                 // 結合アプリ（index.html）の iframe の中
+ks = await KN.syncKininari({ trigger: 'change' });
+ok('開いている気になり帳で合わせる', ks.ok && fakeBrowser.knCalls.length === 1 && fakeBrowser.knCalls[0].tabId === 700);
+ok('送信用の裏タブ・ほかのサイトは使わない', fakeBrowser.knCalls.every(c => c.tabId === 700));
+const sentPayload = fakeBrowser.knCalls[0].payload;
+eq('渡す中身（カテゴリ）', sentPayload.cats, [{ name: '学習', color: '#10b981' }, { name: '技術', color: '#0ea5e9' }]);
+eq('渡す中身（項目。未分類は ""）', sentPayload.items.map(i => [i.u, i.f]).sort(), [['https://sync.example/a', '学習'], ['https://sync.example/b', '']]);
+eq('気になり帳の結果を返す', [ks.moved, ks.created, ks.opened], [1, ['技術'], false]);
+eq('気になり帳にしか無いフォルダを Recall のカテゴリに足す（未分類は足さない）', ks.added, ['株主優待']);
+const ksCats = (await S.getMeta()).cats.map(c => c.name);
+ok('カテゴリとして保存される', ksCats.includes('株主優待') && ksCats.filter(n => n === '未分類').length === 1 && ksCats.length === 4);
+let kst = await ksState();
+ok('合わせた時刻を残し、届いていない印を消す', kst.lastOk > 0 && !kst.pendingAt && kst.last && kst.last.ok === true);
+
+ks = await KN.syncKininari({ trigger: 'change' });
+eq('中身が変わっていなければ気になり帳を呼ばない（足したカテゴリも合わせ済み）', [ks.skipped, fakeBrowser.knCalls.length], ['same', 1]);
+ks = await KN.syncKininari({ trigger: 'load', tabId: 700 });
+eq('30分以内に合わせていれば、開いても合わせ直さない', [ks.skipped, fakeBrowser.knCalls.length], ['recent', 1]);
+await KN.markKnSyncPending();
+ks = await KN.syncKininari({ trigger: 'load', tabId: 700 });
+ok('届いていない変更があれば、開いたときに合わせる', ks.ok && fakeBrowser.knCalls.length === 2);
+ok('合わせたら印は消える', !(await ksState()).pendingAt);
+
+// 合わせている最中に入った変更は、まだ届いていない扱いのまま
+fakeBrowser.knApi = async (p) => { await KN.markKnSyncPending(Date.now() + 5); return answer({ moved: 0 })(p); };
+await KN.markKnSyncPending();
+ks = await KN.syncKininari({ trigger: 'load', tabId: 700 });
+ok('合わせている間に入った変更の印は残す', ks.ok && (await ksState()).pendingAt > 0);
+fakeBrowser.knApi = answer({ moved: 0 });
+
+// カテゴリを変えると、変えた中身で合わせる
+const ksA2 = (await S.getAll()).items.find(i => i.id === ksA.id);
+await S.putItems([{ ...ksA2, c: 'c4' }]);
+ks = await KN.syncKininari({ trigger: 'change' });
+ok('カテゴリを変えたら、その分類で合わせる', ks.ok && fakeBrowser.knCalls.at(-1).payload.items.find(i => i.u === 'https://sync.example/a').f === '技術');
+
+// 送信用の裏タブは、気になり帳が # を消したあとでも使わない（送信が終わると閉じられるため）
+const ksA3 = (await S.getAll()).items.find(i => i.id === ksA.id);
+await S.putItems([{ ...ksA3, c: 'c1' }]);
+sessionMem.rcClipPending = { 700: { url: knTab.url, origin: 'https://kn.example/*', startedAt: Date.now(), hardAt: Date.now() + 25000, reported: '' } };
+const callsClip = fakeBrowser.knCalls.length;
+ks = await KN.syncKininari({ trigger: 'change' });
+eq('送信中の裏タブでは合わせない（気になり帳が # を消していても）', [ks.reason, fakeBrowser.knCalls.length], ['notab', callsClip]);
+delete sessionMem.rcClipPending;
+ks = await KN.syncKininari({ trigger: 'change' });
+ok('送信が終われば、そのタブでも合わせる', ks.ok && fakeBrowser.knCalls.length === callsClip + 1);
+
+// 読み込みが遅い気になり帳（受け口が出るまで少しかかる）
+let late = 0;
+fakeBrowser.knApi = null;
+const lateTimer = setInterval(() => { if (++late === 4) fakeBrowser.knApi = answer({ moved: 0 }); }, 60);
+await KN.markKnSyncPending();
+ks = await KN.syncKininari({ trigger: 'load', tabId: 700 });
+clearInterval(lateTimer);
+ok('読み終えたばかりのページでは、受け口が出るまで待って呼び直す', ks.ok && fakeBrowser.knProbes > 2);
+
+// 受け口の無い（古い）気になり帳
+fakeBrowser.knApi = null;
+const knCallsBefore = fakeBrowser.knCalls.length;
+await KN.markKnSyncPending();
+ks = await KN.syncKininari({ trigger: 'load', tabId: 700 });
+eq('受け口の無い気になり帳では合わせない', [ks.ok, ks.reason, fakeBrowser.knCalls.length], [false, 'noapi', knCallsBefore]);
+ok('そのときも自分ではタブを開かない', fakeBrowser.attempts === 0);
+ok('届いていない印は残る（新しい版を開いたときに合わせる）', (await ksState()).pendingAt > 0);
+ok('タブは開いているので、見直しの予約を置く（結合アプリで気になり帳のタブを選ぶのを待つ）', fakeBrowser.alarms.has(KN.KN_SYNC_ALARM));
+// 見直しは、本当に届いていない変更があるときに気になり帳を見に行く
+const ksB2 = (await S.getAll()).items.find(i => i.id === ksB.id);
+await S.putItems([{ ...ksB2, c: ksB2.c === 'c4' ? 'c1' : 'c4' }]);
+const probesBefore = fakeBrowser.knProbes;
+ks = await KN.syncKininari({ trigger: 'retry' });
+eq('見直しでは1回だけ見る（30秒ごとにまた来る）', [ks.reason, fakeBrowser.knProbes - probesBefore], ['noapi', 1]);
+fakeBrowser.knApi = answer({ moved: 0 });
+ks = await KN.syncKininari({ trigger: 'retry' });
+ok('気になり帳が出ていれば見直しで合わせる', ks.ok && !(await ksState()).pendingAt);
+ok('合わせたら見直しの予約を外す', !fakeBrowser.alarms.has(KN.KN_SYNC_ALARM));
+ks = await KN.syncKininari({ trigger: 'retry' });
+eq('届いていない変更が無ければ見直しでは何もしない', ks.skipped, 'nothing');
+eq('見直しの予約を置くのは「タブはあるのに気になり帳が出ていない」ときだけ',
+  [KN.knRetryAfter({ ok: false, reason: 'noapi' }, 1), KN.knRetryAfter({ ok: false, reason: 'noapi' }, 0), KN.knRetryAfter({ ok: false, reason: 'notab' }, 1),
+   KN.knRetryAfter({ ok: true }, 1), KN.knRetryAfter({ ok: false, reason: 'failed' }, 1), KN.knRetryAfter({ ok: false, reason: 'busy' }, 1)],
+  [true, false, false, false, false, null]);
+fakeBrowser.knApi = null;
+await KN.markKnSyncPending();
+
+// 気になり帳が失敗を返した
+fakeBrowser.knApi = () => ({ ok: false, error: '保存できませんでした' });
+ks = await KN.syncKininari({ trigger: 'load', tabId: 700 });
+eq('気になり帳の失敗の理由を返す', [ks.ok, ks.reason, ks.error], [false, 'failed', '保存できませんでした']);
+ok('失敗したら印は残る', (await ksState()).pendingAt > 0);
+
+// ほかのサイトのタブを読み終えたとき
+fakeBrowser.tabs.set(702, 'https://other.example/');
+fakeBrowser.knApi = answer({ moved: 0 });
+const knCallsOther = fakeBrowser.knCalls.length;
+ks = await KN.syncKininari({ trigger: 'load', tabId: 702 });
+eq('ほかのサイトのタブでは合わせない', [ks.reason, fakeBrowser.knCalls.length], ['notab', knCallsOther]);
+
+// 送信をオフにしているときは自動では合わせない
+await S.setMeta({ s: { knOn: false } });
+ks = await KN.syncKininari({ trigger: 'change' });
+eq('「気になり帳へ送る」がオフなら自動では合わせない', ks.reason, 'off');
+
+// 手動: 開いていなければ裏のタブで開いて合わせ、閉じる（オフでも URL があれば動く）
+fakeBrowser.queryTabs = [];
+fakeBrowser.tabStatus = 'complete';
+fakeBrowser.knFrame = 0;
+const nCalls = fakeBrowser.knCalls.length;
+ks = await KN.syncKininari({ manual: true, knUrl: 'https://kn.example/app/kininari.html#knadd=old' });
+ok('手動なら裏のタブで開いて合わせる', ks.ok && ks.opened === true && fakeBrowser.attempts === 1 && fakeBrowser.knCalls.length === nCalls + 1);
+eq('開くのは保存先そのもの（# 以降は付けない）', fakeBrowser.created[0], 'https://kn.example/app/kininari.html');
+ok('終わったら閉じる', fakeBrowser.removed.length === 1 && !fakeBrowser.tabs.has(fakeBrowser.removed[0]));
+ok('手動で合わせても届いていない印は消える', !(await ksState()).pendingAt);
+
+// 手動・古い気になり帳: フォルダを読んでカテゴリに足すだけ（1.10 の「フォルダを取り込む」と同じ）
+fakeBrowser.knApi = null;
+scriptingResult = JSON.stringify({ memos: [], notebooks: [{ id: 'n1', name: '未分類' }, { id: 'n2', name: 'オレンジカード', color: '#3E6CA3' }] });
+ks = await KN.syncKininari({ manual: true, knUrl: 'https://kn.example/app/kininari.html' });
+ok('古い気になり帳でもフォルダは取り込む', ks.ok && ks.old === true && ks.added.length === 1 && ks.added[0] === 'オレンジカード');
+ok('そのときもタブは閉じる', fakeBrowser.removed.length === 2 && fakeBrowser.removed.every(id => !fakeBrowser.tabs.has(id)));
+scriptingResult = null;
+ks = await KN.syncKininari({ manual: true, knUrl: 'https://kn.example/app/kininari.html' });
+eq('気になり帳のデータも無ければそう伝える', ks.reason, 'nodata');
+scriptingResult = {};
+fakeBrowser.hasPermission = false;
+ks = await KN.syncKininari({ manual: true, knUrl: 'https://kn.example/app/kininari.html' });
+ok('手動でも許可が無ければ開かない', ks.reason === 'perm' && fakeBrowser.attempts === 3);
+fakeBrowser.hasPermission = true;
+ks = await KN.syncKininari({ manual: true, knUrl: 'data:text/html,x' });
+eq('URL が http(s) でなければ合わせない', ks.reason, 'nourl');
+fakeBrowser.createFails = true;
+ks = await KN.syncKininari({ manual: true, knUrl: 'https://kn.example/app/kininari.html' });
+eq('開けなければそう伝える', ks.reason, 'open');
+fakeBrowser.createFails = false;
+
+// 同時に頼まれたら1回ずつ（同じメモを2回動かさない）
+await S.setMeta({ s: { knOn: true } });
+fakeBrowser.queryTabs = [knTab];
+let inFlight = 0, maxInFlight = 0;
+fakeBrowser.knApi = async (p) => { inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); await new Promise(r => setTimeout(r, 80)); inFlight--; return answer({ moved: 0 })(p); };
+const ksItems = (await S.getAll()).items;
+await S.putItems([{ ...ksItems.find(i => i.id === ksB.id), c: 'c1' }]);
+const before3 = fakeBrowser.knCalls.length;
+const [ksR1, ksR2, ksR3] = await Promise.all([
+  KN.syncKininari({ trigger: 'change' }), KN.syncKininari({ trigger: 'change' }), KN.syncKininari({ manual: true })
+]);
+await new Promise(r => setTimeout(r, 400));
+ok('同時に動くのは1回だけ', maxInFlight === 1);
+ok('自動の重なりはまとめ、手動は待ってから動く', ksR1.ok && ksR2.reason === 'busy' && ksR3.ok && fakeBrowser.knCalls.length - before3 >= 2);
+
+Object.assign(KN.KN_SYNC_WAIT, KW);
+fakeBrowser.reset();
+await resetAll();
 
 console.log(`\n${pass} 件成功 / ${fail} 件失敗`);
 process.exit(fail ? 1 : 0);
