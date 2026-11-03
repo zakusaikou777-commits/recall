@@ -177,7 +177,7 @@
         <div class="faint" style="font-size:11.5px">送れなかった項目は5分ごとに自動で送り直します。保存先URLを直すとすぐに再送します。</div>
       </div>
       <p class="faint" style="margin-top:8px">
-        Recall のカテゴリは、気になり帳では同じ名前の<b>フォルダ</b>になります。タグはメモ本文の末尾に <code>#タグ</code> として付きます。
+        Recall のカテゴリは、気になり帳では同じ名前の<b>フォルダ</b>になります（未分類は「フォルダなし」。あとからカテゴリを変えても、気になり帳のメモがついてきます）。タグはメモ本文の末尾に <code>#タグ</code> として付きます。
       </p>
     </section>
 
@@ -238,13 +238,21 @@
       <div id="catEditor" class="cateditor"></div>
       <div class="catfromkn">
         <div class="row" style="flex-wrap:wrap">
-          <button type="button" id="catFromKn" class="btn sm">気になり帳のフォルダを取り込む</button>
+          <button type="button" id="knSync" class="btn sm">気になり帳と合わせる</button>
         </div>
         <p class="faint" style="font-size:11.5px;margin:6px 0 0">
-          Recall のカテゴリは、気になり帳では同じ名前の<b>フォルダ</b>になります。気になり帳にあって Recall に無いフォルダを、カテゴリとして足します
-          （同じ名前のものはそのまま。消したり名前を変えたりはしません）。「気になり帳へ送る」の URL と「保存の確認を許可する」が要ります。
+          Recall のカテゴリは、気になり帳では同じ名前の<b>フォルダ</b>になります（未分類は「フォルダなし」）。
+          Recall でカテゴリを変えると、気になり帳のメモもそのフォルダへ移ります。カテゴリを足すと気になり帳にフォルダができ、
+          気になり帳で足したフォルダは Recall のカテゴリに加わります。
+          <b>削除と名前の変更は伝わりません</b>。気になり帳の中でメモを動かしても、Recall のカテゴリは変わりません。
         </p>
-        <div id="catFromKnMsg" class="faint" style="font-size:11.5px;margin-top:4px"></div>
+        <p class="faint" style="font-size:11.5px;margin:4px 0 0">
+          ふだんは、開いている気になり帳のタブで自動で合わせます（自分ではタブを開きません）。
+          このボタンは今すぐ合わせます（気になり帳が開いていなければ裏で開いて、終わったら閉じます）。
+          「気になり帳へ送る」の URL と「保存の確認を許可する」が要ります。
+        </p>
+        <div id="knSyncState" class="faint" style="font-size:11.5px;margin-top:4px"></div>
+        <div id="knSyncMsg" class="faint" style="font-size:11.5px;margin-top:4px"></div>
       </div>
     </section>
 

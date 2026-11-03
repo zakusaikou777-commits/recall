@@ -7,7 +7,10 @@
    ものを、そのまま持ち込んでいる（取りこぼし・二重報告・タブの
    開きっぱなしを避けるための工夫がすべて入っている）。
    ============================================================ */
-import { clip, thumbOf, normalizeUrl, getAll, putItems, STATUS, DEFAULT_STEPS, CAT_COLORS } from './store.js';
+import {
+  clip, thumbOf, normalizeUrl, getAll, getMeta, setMeta, putItems, newId,
+  STATUS, DEFAULT_STEPS, CAT_COLORS, META_KEY, LOCAL_PREFIX
+} from './store.js';
 
 /** 気になり帳が受け付けるカテゴリ（これ以外は「調べる」になる） */
 export const KN_CATEGORIES = ['メモ', 'アイデア', '調べる', 'やること', '行きたい'];
@@ -108,7 +111,8 @@ export function buildClipUrl(base, fields) {
       n: note,
       img: img,
       c: category,
-      f: clip(fields.folder || '', 40)
+      f: clip(fields.folder || '', 40),   // "" = フォルダなし（Recall の未分類）
+      src: 'recall'                        // 気になり帳は、Recall から来たメモに分類の控え（rc）を付ける
     };
     if (fields.tags && fields.tags.length) p.tags = fields.tags;
     if (fields.srs) p.srs = fields.srs;          // 復習の進み具合をそのまま引き継ぐ
@@ -136,6 +140,19 @@ export function buildClipUrl(base, fields) {
   return { url, cutImg, cutNote, payload };
 }
 
+/**
+ * Recall のカテゴリを気になり帳のフォルダ名にする。
+ * 未分類（c0）と見つからないカテゴリは ""（＝気になり帳の「フォルダなし」）。
+ * 以前は「未分類」という名前のまま送っていたため、気になり帳に「未分類」フォルダができ、
+ * Recall で分け直してもメモがそこに溜まったままになっていた。
+ */
+const KN_UNSORTED = '未分類';
+export function knFolderName(cat) {
+  if (!cat || cat.id === 'c0') return '';
+  const name = String(cat.name || '').trim();
+  return name === KN_UNSORTED ? '' : name;   // 名前が「未分類」のものも同じ扱い（気になり帳もそう読む）
+}
+
 /** Recall の項目を、気になり帳へ送る形にそろえる */
 export function clipFieldsFor(item, meta, rich) {
   const cat = (meta.cats || []).find(c => c.id === item.c);
@@ -145,7 +162,7 @@ export function clipFieldsFor(item, meta, rich) {
     note: clipNote(item),
     image: thumbOf(item, rich),          // YouTube はIDから、それ以外は保存済みのOGP画像
     category: meta.s.knCat,
-    folder: cat ? cat.name : '',         // Recall のカテゴリ＝気になり帳のフォルダ
+    folder: knFolderName(cat),           // Recall のカテゴリ＝気になり帳のフォルダ（未分類は「フォルダなし」）
     tags: (item.g || []).slice(0, 12),
     srs: srsFor(item, meta.s && meta.s.steps)
   };
@@ -734,6 +751,18 @@ export function mergeFolderCats(cats, folders, makeId) {
   return { cats: [...(cats || []), ...add], added: add.map(c => c.name), same, tooLong };
 }
 
+/** 気になり帳のデータ（localStorage）をそのタブから読む。undefined はまだ読み込み中・読めないページ */
+async function readKnData(tabId) {
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (key) => { try { return localStorage.getItem(key); } catch { return null; } },
+      args: [KN_DATA_KEY]
+    });
+    return r ? r.result : null;
+  } catch { return undefined; }
+}
+
 /**
  * 気になり帳のフォルダを読む。気になり帳のサイトのタブが開いていればそこから、無ければ裏のタブで開いて読み、閉じる。
  * @returns {Promise<{ok: boolean, folders?: Array, reason?: string, message?: string}>}
@@ -745,16 +774,7 @@ export async function readKininariFolders(knUrl) {
   if (!(await canScript(origin))) {
     return { ok: false, reason: 'perm', message: '先に「保存の確認を許可する」を押してください（気になり帳のフォルダを読むのに使います）。' };
   }
-  const read = async (tabId) => {
-    try {
-      const [r] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (key) => { try { return localStorage.getItem(key); } catch { return null; } },
-        args: [KN_DATA_KEY]
-      });
-      return r ? r.result : null;
-    } catch { return undefined; }   // まだ読み込み中・読めないページ
-  };
+  const read = readKnData;
   const done = (v) => {
     const folders = v == null ? null : foldersFromKininariData(v);
     if (!folders) return { ok: false, reason: 'nodata', message: 'この Chrome には気になり帳のデータが見つかりませんでした（このブラウザで気になり帳を開いたことがあるか確かめてください）。' };
@@ -784,6 +804,477 @@ export async function readKininariFolders(knUrl) {
   } finally {
     try { chrome.tabs.remove(tab.id, () => void chrome.runtime.lastError); } catch { /* 続行 */ }
   }
+}
+
+/* ============================================================
+   気になり帳と合わせる（分類とフォルダの一覧）
+     ・分類は Recall に合わせる。Recall でカテゴリを変えると、気になり帳のメモもそのフォルダへ移る
+       （気になり帳の中でメモを動かしても Recall は変わらない）。
+     ・フォルダ（カテゴリ）の一覧は両方向。どちらかで足したものは、もう片方にもできる。
+       消したり名前を変えたりは伝えない（片方の操作で、もう片方の中身が消えると取り返しがつかない）。
+     ・Recall の未分類（c0）＝ 気になり帳の「フォルダなし」。
+   やり方: 開いている気になり帳のページの window.__kininariRecall.apply(payload) を呼ぶ
+   （取り決めは「Recall ⇄ 気になり帳 フォルダ同期 protocol v1」）。
+   自動で合わせるときは、すでに開いているタブだけを使う。勝手にタブを開くと、
+   カテゴリを変えるたびに画面の外でタブが開いたり閉じたりして落ち着かないため。
+   ============================================================ */
+
+export const KN_SYNC_KEY = 'rcKnSync';          // local: 合わせた記録 { lastOk, sig, pendingAt, last }
+export const KN_SYNC_DELAY_MS = 3000;            // 変えてから合わせるまで待つ（続けて変えたときは1回にまとめる）
+export const KN_SYNC_STALE_MS = 30 * 60000;      // 気になり帳を開いたとき、これより前に合わせたきりなら合わせ直す
+// 開いているタブに気になり帳がまだ出ていないとき（結合アプリ index.html で別のアプリを見ている など）に見直す間隔。
+// index.html は気になり帳のタブを選んだときに iframe を読み込むが、iframe の読み込みでは tabs.onUpdated が来ないため
+export const KN_SYNC_ALARM = 'recall-kn-sync-retry';
+const KN_RETRY_MIN = 0.5;                        // 分（chrome.alarms の下限は 30 秒）
+// 待ち時間（テストでは短くする）
+export const KN_SYNC_WAIT = {
+  api: 10000,      // 読み込んだばかりのページで、受け口が出てくるまで待つ（気になり帳はデータを非同期で読む）
+  probe: 3000,     // 前から開いているタブ（読み終わっているので、出ているならもう出ている）
+  poll: 500,       // 受け口を探し直す間隔
+  load: 20000,     // 手動で裏のタブを開いたとき、読み終わるまで待つ
+  apply: 20000     // 気になり帳が返事をしないとき、ここで諦める
+};
+const HEX6 = /^#[0-9a-fA-F]{6}$/;                // Recall の色（<input type=color> が読める形）
+
+/**
+ * 気になり帳がメモの重複を見分けるときと同じ形の URL（# 以降と末尾の / は区別しない）。
+ * 同じページが Recall に2件あると、気になり帳のメモが2つのフォルダの間を行ったり来たりするので、そろえて1件にする。
+ */
+export function knUrlKey(u) {
+  const s = typeof u === 'string' ? u.trim() : '';
+  if (!s) return '';
+  try { const x = new URL(s); x.hash = ''; return x.href.replace(/\/+$/, ''); }
+  catch { return s.replace(/#.*$/, '').replace(/\/+$/, ''); }
+}
+
+/**
+ * 気になり帳へ渡す中身を作る（純粋な関数）。
+ *   cats  … 未分類を除いた全カテゴリ（名前と色）
+ *   items … http(s) の全項目（URL はそのまま。f はフォルダ名、未分類・見つからないカテゴリは ""）
+ * 同じページが2件あれば先に来た方（getAll は新しい順）を使う。
+ */
+export function buildSyncPayload(items, meta) {
+  const list = (meta && Array.isArray(meta.cats)) ? meta.cats : [];
+  const cats = [];
+  const seen = new Set();
+  for (const c of list) {
+    const name = knFolderName(c);
+    const key = name.toLowerCase();
+    if (!name || seen.has(key)) continue;   // 大文字小文字だけ違う名前は、気になり帳では同じフォルダ
+    seen.add(key);
+    cats.push({ name, color: HEX6.test(String((c && c.color) || '')) ? c.color : '' });
+  }
+  const byId = new Map(list.filter(Boolean).map(c => [c.id, c]));
+  const out = [];
+  const urls = new Set();
+  for (const it of items || []) {
+    const u = it && typeof it.u === 'string' ? it.u : '';
+    if (!/^https?:\/\//i.test(u)) continue;
+    const key = knUrlKey(u);
+    if (urls.has(key)) continue;
+    urls.add(key);
+    out.push({ u, f: knFolderName(byId.get(it.c)) });
+  }
+  return { v: 1, cats, items: out };
+}
+
+/**
+ * 中身の指紋。前に合わせたときと同じなら、変更のたびに気になり帳を呼ばずに済む。
+ * 全文を持つと大きいので短い要約にする（FNV-1a を2本と長さ）。保存先が変われば別物として扱う。
+ */
+export function payloadSig(payload, origin) {
+  const s = String(origin || '') + '\n' + JSON.stringify(payload);
+  let a = 0x811c9dc5, b = 0x01000193 ^ s.length;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    a = Math.imul(a ^ c, 16777619);
+    b = Math.imul(b ^ c, 2246822519);
+  }
+  return (a >>> 0).toString(16).padStart(8, '0') + (b >>> 0).toString(16).padStart(8, '0') + ':' + s.length;
+}
+
+/**
+ * 気になり帳の返事からフォルダを取り出す（純粋な関数）。
+ * 「未分類」は Recall の未分類と同じものなので足さない。名前の無いもの・同じ名前は除く。
+ */
+export function foldersFromSyncResult(res) {
+  const out = [];
+  const seen = new Set();
+  for (const f of (res && Array.isArray(res.folders)) ? res.folders : []) {
+    if (!f || typeof f !== 'object') continue;
+    const name = typeof f.name === 'string' ? f.name.trim() : '';
+    if (!name || name === KN_UNSORTED || seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+    out.push({ name, color: HEX6.test(String(f.color || '')) ? f.color : '' });
+  }
+  return out;
+}
+
+/** 気になり帳の返事のうち、受け口のあったフレームのものを選ぶ。どのフレームにも無ければ null */
+export function pickApplyResult(results) {
+  let first = null;
+  for (const r of results || []) {
+    const v = r && r.result;
+    if (!v || typeof v !== 'object' || !v.found) continue;
+    const res = (v.result && typeof v.result === 'object') ? v.result : { ok: false, error: '気になり帳から返事がありませんでした' };
+    if (res.ok) return res;
+    if (!first) first = res;
+  }
+  return first;
+}
+
+const catNamesOf = (m) => JSON.stringify(((m && Array.isArray(m.cats)) ? m.cats : []).map(c => [c && c.id, String((c && c.name) || '').trim()]));
+const knCfgOf = (m) => JSON.stringify([!!(m && m.s && m.s.knOn), String((m && m.s && m.s.knUrl) || '')]);
+
+/**
+ * この変更で、気になり帳と合わせ直す必要が出たか（純粋な関数。storage.onChanged の中身を見る）。
+ * 項目のカテゴリ・URL、カテゴリの一覧（名前）、送信の設定が変わったときだけ。
+ * 復習の結果やメモの編集のたびに合わせに行かないようにする（項目の追加は、送るときにフォルダ付きで届く）。
+ */
+export function knSyncRelevant(changes, area) {
+  if (!changes || typeof changes !== 'object') return false;
+  if (area === 'sync') {
+    const ch = changes[META_KEY];
+    if (!ch) return false;
+    return catNamesOf(ch.oldValue) !== catNamesOf(ch.newValue) || knCfgOf(ch.oldValue) !== knCfgOf(ch.newValue);
+  }
+  if (area !== 'local') return false;
+  for (const [k, ch] of Object.entries(changes)) {
+    if (!k.startsWith(LOCAL_PREFIX) || !ch) continue;
+    const a = ch.oldValue, b = ch.newValue;
+    if (!a || !b) continue;
+    if (a.c !== b.c || a.u !== b.u) return true;
+  }
+  return false;
+}
+
+/** 気になり帳を開いたときに合わせるか（未反映の変更がある・しばらく合わせていない） */
+export function knSyncDueOnLoad(state, now = Date.now()) {
+  const s = state || {};
+  return !!s.pendingAt || !(s.lastOk > 0) || now - s.lastOk >= KN_SYNC_STALE_MS;
+}
+
+/** そのタブで合わせてよいか。送信用の裏タブ（#knadd=）は閉じられる途中なので使わない */
+export function knTabUsable(tab, origin, needComplete = true) {
+  if (!tab || tab.id == null || tab.discarded) return false;
+  const u = typeof tab.url === 'string' ? tab.url : '';
+  if (!u || u.includes('#knadd=') || originOf(u) !== origin) return false;
+  return !needComplete || tab.status === 'complete';
+}
+
+export const KN_SYNC_MESSAGE = {
+  nourl: '気になり帳の URL が未設定です（「気になり帳へ送る」の欄に入れてください）。',
+  perm: '先に「気になり帳へ送る」の「保存の確認を許可する」を押してください（気になり帳と合わせるのに使います）。',
+  open: '気になり帳を開けませんでした。',
+  timeout: '気になり帳を開けませんでした。URL とネットの接続を確かめてください。',
+  noapi: '気になり帳の「合わせる」の受け口が見つかりませんでした。気になり帳を新しい版にしてください（URL が kininari.html を指しているかも確かめてください）。',
+  nodata: 'この Chrome には気になり帳のデータが見つかりませんでした（このブラウザで気になり帳を開いたことがあるか確かめてください）。',
+  failed: '気になり帳と合わせられませんでした。',
+  off: '「気になり帳へ送る」がオフです。',
+  notab: '開いている気になり帳がありません。',
+  busy: 'ほかの合わせる処理が動いています。'
+};
+
+/** 結果を一言で表す（設定画面に出す） */
+export function knSyncMessage(res) {
+  if (!res) return '結果を受け取れませんでした。';
+  const long = (res.tooLong && res.tooLong.length)
+    ? `名前が長い ${res.tooLong.length} 件（${res.tooLong.map(n => clip(n, 16)).join('・')}）はカテゴリにできませんでした（カテゴリ名は${CAT_NAME_MAX}文字まで）。`
+    : '';
+  const added = (res.added && res.added.length) ? `気になり帳のフォルダ ${res.added.length} 件をカテゴリに足しました（${res.added.join('・')}）。` : '';
+  if (!res.ok) {
+    const base = KN_SYNC_MESSAGE[res.reason] || KN_SYNC_MESSAGE.failed;
+    return base + (res.error ? `（${clip(res.error, 120)}）` : '');
+  }
+  if (res.old) {
+    // 受け口の無い古い気になり帳。フォルダを読んで足すことだけはできる
+    return '気になり帳と分類を合わせられませんでした（気になり帳が古い版か、URL が kininari.html を指していません）。フォルダの取り込みだけしました。'
+      + (added || 'フォルダはすべて Recall のカテゴリにあります。') + long;
+  }
+  const parts = [];
+  const moved = Math.max(0, Number(res.moved) || 0);
+  if (moved) parts.push(`メモ ${moved} 件を Recall のカテゴリのフォルダへ移しました。`);
+  if (res.created && res.created.length) parts.push(`気になり帳にフォルダを ${res.created.length} 件作りました（${res.created.join('・')}）。`);
+  if (added) parts.push(added);
+  if (res.removed && res.removed.length) parts.push(`空になった「${res.removed.join('・')}」フォルダを片付けました。`);
+  return '気になり帳と合わせました。' + (parts.length ? parts.join('') : '変わったところはありません。') + long;
+}
+
+/* ---------- 記録（Service Worker が止まっても残るよう local に置く） ---------- */
+
+export async function getKnSyncState() {
+  try {
+    const v = (await chrome.storage.local.get(KN_SYNC_KEY))[KN_SYNC_KEY];
+    return v && typeof v === 'object' ? v : {};
+  } catch { return {}; }
+}
+
+/** 記録の書き換えは必ずここを通す（「変更あり」の印と、合わせ終わった記録が取り合いにならないように） */
+function editKnSyncState(fn) {
+  return serial(async () => {
+    const cur = await getKnSyncState();
+    const next = fn({ ...cur });
+    if (next && JSON.stringify(next) !== JSON.stringify(cur)) {
+      try { await chrome.storage.local.set({ [KN_SYNC_KEY]: next }); } catch { /* 次の変更か、気になり帳を開いたときに合わせる */ }
+    }
+    return next || cur;
+  });
+}
+
+/**
+ * 「まだ気になり帳に届いていない変更がある」印。local に置くので、Service Worker が止まっても、
+ * ブラウザを閉じても残り、次に気になり帳を開いたときに合わせられる。
+ */
+export function markKnSyncPending(now = Date.now()) {
+  return editKnSyncState(s => ({ ...s, pendingAt: now }));
+}
+
+/* ---------- 気になり帳のページの中で動かす ---------- */
+
+/**
+ * ページ本体（MAIN）で動かす。chrome.scripting で送るので、外の変数は使えない。
+ * 受け口はデータを読み終えてから出てくるので、無ければ「まだ」と返す（呼ぶ側が少し待って呼び直す）。
+ */
+function runKininariApply(payload, timeoutMs) {
+  const api = window.__kininariRecall;
+  if (!api || typeof api.apply !== 'function') return { found: false };
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (result) => { if (!settled) { settled = true; resolve({ found: true, result }); } };
+    const timer = setTimeout(() => done({ ok: false, error: 'timeout' }), timeoutMs);
+    let p;
+    try { p = Promise.resolve(api.apply(payload)); }
+    catch (e) { p = Promise.reject(e); }
+    p.then((r) => {
+      clearTimeout(timer);
+      let out = null;
+      try { out = JSON.parse(JSON.stringify(r === undefined ? null : r)); } catch { out = { ok: false, error: 'bad result' }; }
+      done(out);
+    }, (e) => {
+      clearTimeout(timer);
+      done({ ok: false, error: String((e && e.message) || e) });
+    });
+  });
+}
+
+/**
+ * そのタブの気になり帳に apply を頼む。結合アプリ（index.html）では iframe の中にあるので、全フレームに送る。
+ * 受け口が出るまで waitMs だけ呼び直す。どのフレームにも無ければ null。
+ */
+async function applyInTab(tabId, payload, waitMs) {
+  const end = Date.now() + waitMs;
+  for (;;) {
+    let results = null;
+    try {
+      results = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        world: 'MAIN',
+        func: runKininariApply,
+        args: [payload, KN_SYNC_WAIT.apply]
+      });
+    } catch { results = null; }   // 読み込み中・閉じられた・読めないページ
+    const res = pickApplyResult(results);
+    if (res) return res;
+    if (Date.now() >= end || !(await tabExists(tabId))) return null;
+    await sleep(KN_SYNC_WAIT.poll);
+  }
+}
+
+/**
+ * 手動のときだけ: 気になり帳を裏のタブで開いて合わせ、閉じる。
+ * 受け口の無い古い気になり帳なら、フォルダを読むだけにする（1.10 の「フォルダを取り込む」と同じ）。
+ */
+async function applyInNewTab(base, payload) {
+  let tab = null;
+  try { tab = await chrome.tabs.create({ url: base, active: false }); }
+  catch (e) { return { reason: 'open', error: String((e && e.message) || e) }; }
+  try {
+    const end = Date.now() + KN_SYNC_WAIT.load;
+    while (Date.now() < end && !(await tabLoaded(tab.id))) {
+      if (!(await tabExists(tab.id))) return { reason: 'open' };
+      await sleep(Math.min(400, KN_SYNC_WAIT.poll));
+    }
+    if (!(await tabLoaded(tab.id))) return { reason: 'timeout' };
+    const res = await applyInTab(tab.id, payload, KN_SYNC_WAIT.api);
+    if (res) return { res };
+    const raw = await readKnData(tab.id);
+    const folders = typeof raw === 'string' ? foldersFromKininariData(raw) : null;
+    if (!folders) return { reason: raw === undefined ? 'noapi' : 'nodata' };
+    return { old: true, folders };
+  } finally {
+    try { chrome.tabs.remove(tab.id, () => void chrome.runtime.lastError); } catch { /* 続行 */ }
+  }
+}
+
+/** 気になり帳のフォルダを Recall のカテゴリに足す（足すだけ。消したり名前を変えたりはしない） */
+async function addFolderCats(folders) {
+  const cur = await getMeta();
+  const r = mergeFolderCats(cur.cats, folders, () => 'c' + newId());
+  if (!r.added.length) return { ...r, ok: true, cats: cur.cats };
+  const w = await setMeta({ cats: r.cats });
+  if (!w.ok) return { ...r, ok: false, added: [], cats: cur.cats, error: w.error };
+  return { ...r, ok: true };
+}
+
+/**
+ * 見直しの予約。届いていない変更があり、気になり帳のサイトのタブは開いているのに気になり帳が出ていないときだけ置く。
+ * 合わせられた・タブが無くなった（次に開いたときに合わせる）・使えない設定のときは外す。
+ */
+async function setKnRetry(on) {
+  try {
+    if (!on) { await chrome.alarms.clear(KN_SYNC_ALARM); return; }
+    if (!(await chrome.alarms.get(KN_SYNC_ALARM))) {
+      await chrome.alarms.create(KN_SYNC_ALARM, { delayInMinutes: KN_RETRY_MIN, periodInMinutes: KN_RETRY_MIN });
+    }
+  } catch { /* 次の変更か、気になり帳を開いたときに合わせる */ }
+}
+
+/** 自動の回の結果から、見直しの予約を置くか外すかを決める（純粋な関数） */
+export function knRetryAfter(res, pending) {
+  if (!res || res.reason === 'busy') return null;                 // 動いている回が決める
+  if (res.reason === 'noapi') return !!pending;
+  return false;
+}
+
+/* ---------- 合わせる（自動・手動の入り口） ---------- */
+
+let knRun = null;     // 動いている回。一度に1回だけ（同じメモを2回動かさない）
+let knAgain = null;   // 動いている間に頼まれた自動の回（終わってからもう一度）
+
+/**
+ * 気になり帳と合わせる。
+ *   opts.trigger 'change' … Recall の分類が変わった（少し待ってから・開いているタブだけ）
+ *                'load'   … 気になり帳のタブを読み終えた（opts.tabId。未反映の変更があるか、しばらく合わせていないとき）
+ *                'retry'  … 見直しの予約（未反映の変更があるときだけ。開いているタブだけ）
+ *   opts.manual  … 設定の「気になり帳と合わせる」。開いていなければ裏のタブで開き、終わったら閉じる
+ *   opts.knUrl   … 手動のとき、設定画面で入力中の URL
+ * @returns {Promise<{ok:boolean, reason?:string, skipped?:string, moved?:number, created?:string[], removed?:string[],
+ *   added?:string[], tooLong?:string[], same?:number, old?:boolean, opened?:boolean, error?:string}>}
+ */
+export async function syncKininari(opts = {}) {
+  if (knRun) {
+    if (!opts.manual) { knAgain = opts; return { ok: false, reason: 'busy' }; }
+    while (knRun) await knRun.catch(() => {});   // 手動は、動いている回が終わるのを待ってから
+  }
+  knRun = (async () => {
+    try { return await knSyncOnce(opts); }
+    catch (e) { return { ok: false, reason: 'failed', error: String((e && e.message) || e) }; }
+    finally { knRun = null; }
+  })();
+  const res = await knRun;
+  const retry = knRetryAfter(res, (await getKnSyncState()).pendingAt);
+  if (retry !== null) await setKnRetry(retry);
+  if (knAgain && !knRun) {
+    const again = knAgain;
+    knAgain = null;
+    syncKininari(again).catch(() => {});
+  }
+  return res;
+}
+
+async function knSyncOnce(opts) {
+  const manual = !!opts.manual;
+  const trigger = manual ? 'manual' : (opts.trigger || 'change');
+  const startedAt = Date.now();
+  const { items, meta } = await getAll();
+  // 自動で合わせるのは「気になり帳へ送る」をオンにしているときだけ
+  if (!manual && !clipEnabled(meta)) return { ok: false, reason: 'off' };
+  const base = String((manual && opts.knUrl) || meta.s.knUrl || '').trim().split('#')[0];
+  const origin = originOf(base);
+  if (!origin) return { ok: false, reason: 'nourl' };
+  if (!(await canScript(origin))) return { ok: false, reason: 'perm' };   // 自動のときは黙って見送る
+
+  const payload = buildSyncPayload(items, meta);
+  const sig = payloadSig(payload, origin);
+  const state = await getKnSyncState();
+  if (trigger === 'retry' && !state.pendingAt) return { ok: true, skipped: 'nothing' };
+  if ((trigger === 'change' || trigger === 'retry') && state.sig === sig) {
+    // 前に合わせたときと同じ（変えて、すぐ戻した など）。気になり帳を呼ぶまでもない
+    await editKnSyncState(s => (s.pendingAt && s.pendingAt <= startedAt ? { ...s, pendingAt: 0 } : null));
+    return { ok: true, skipped: 'same' };
+  }
+  if (trigger === 'load' && !knSyncDueOnLoad(state, startedAt)) return { ok: true, skipped: 'recent' };
+
+  // 使うタブを決める。自動のときは開いているタブだけ（自分では開かない）。
+  // 送信用の裏タブは、気になり帳が # を消したあとでも見分けられるよう、送信中のタブの記録でも除く
+  const clipTabs = new Set(Object.keys(await getPending()));
+  let tabs = [];
+  if (trigger === 'load') {
+    try { const t = await chrome.tabs.get(opts.tabId); if (knTabUsable(t, origin, false)) tabs = [t]; } catch { tabs = []; }
+  } else {
+    try { tabs = ((await chrome.tabs.query({ url: origin })) || []).filter(t => knTabUsable(t, origin)); } catch { tabs = []; }
+  }
+  tabs = tabs.filter(t => !clipTabs.has(String(t.id)));
+  let res = null;
+  for (const t of tabs) {
+    // 読み終えたばかりなら受け口が出るまで待つ。見直しの予約では1回見るだけ（30秒ごとにまた来る）
+    const wait = trigger === 'load' ? KN_SYNC_WAIT.api : (trigger === 'retry' ? 0 : KN_SYNC_WAIT.probe);
+    res = await applyInTab(t.id, payload, wait);
+    if (res) break;
+  }
+
+  let opened = false, old = null, reason = '';
+  if (!res) {
+    if (!manual) reason = tabs.length ? 'noapi' : 'notab';
+    else {
+      opened = true;
+      const r = await applyInNewTab(base, payload);
+      if (r.res) res = r.res;
+      else if (r.old) old = r.folders;
+      else reason = r.reason || 'failed';
+    }
+  }
+
+  const finish = async (out) => {
+    await editKnSyncState(s => {
+      const next = { ...s, last: { at: Date.now(), ok: !!out.ok, reason: out.reason || '', trigger, moved: out.moved || 0,
+        created: (out.created || []).length, added: (out.added || []).length } };
+      if (out.ok && !out.old) {
+        next.lastOk = Date.now();
+        next.sig = out.sig;
+        // 合わせている間に入った変更は、まだ届いていない（印を残して、もう一度合わせる）
+        if (!(s.pendingAt > startedAt)) next.pendingAt = 0;
+      }
+      return next;
+    });
+    delete out.sig;
+    return { ...out, opened };
+  };
+
+  if (old) {
+    const m = await addFolderCats(old);
+    return finish({ ok: m.ok, old: true, added: m.added, tooLong: m.tooLong, same: m.same, error: m.error || '' });
+  }
+  if (!res) return finish({ ok: false, reason });
+  if (!res.ok) return finish({ ok: false, reason: 'failed', error: String(res.error || '') });
+
+  const m = await addFolderCats(foldersFromSyncResult(res));
+  // 足したカテゴリは気になり帳から来たもの（向こうにはもうある）。足した後の中身を「合わせ済み」として控える
+  const after = m.added.length ? payloadSig(buildSyncPayload(items, { ...meta, cats: m.cats }), origin) : sig;
+  return finish({
+    ok: m.ok, sig: after, error: m.error || '',
+    moved: Math.max(0, Number(res.moved) || 0),
+    created: Array.isArray(res.created) ? res.created.filter(n => typeof n === 'string') : [],
+    removed: Array.isArray(res.removed) ? res.removed.filter(n => typeof n === 'string') : [],
+    added: m.added, tooLong: m.tooLong, same: m.same
+  });
+}
+
+/**
+ * 気になり帳のタブを読み終えたら合わせる（未反映の変更がある・しばらく合わせていないとき）。
+ * どのページを開いても呼ばれるので、保存先と同じサイトかを先に安く確かめる。
+ */
+export function onKnTabUpdated(tabId, info, tab) {
+  if (!info || info.status !== 'complete') return;
+  const u = String((tab && tab.url) || '');
+  if (!/^https?:\/\//i.test(u) || u.includes('#knadd=')) return;
+  (async () => {
+    const meta = await getMeta();
+    if (!clipEnabled(meta)) return;
+    const origin = originOf(String(meta.s.knUrl || '').trim().split('#')[0]);
+    if (!origin || originOf(u) !== origin) return;
+    await syncKininari({ trigger: 'load', tabId });
+  })().catch(() => {});
 }
 
 export function onClipTabUpdated(tabId, info) {

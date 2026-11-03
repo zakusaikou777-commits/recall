@@ -13,7 +13,8 @@ import { collectPageMeta } from './pagemeta.js';
 import {
   sweepClips, adoptRestoredClipTabs, onClipTabUpdated, onClipTabRemoved,
   enqueueClip, flushClips, queueSummary, resetQueueTries, removeFromQueue,
-  clipEnabled, clipStateOf, CLIP_ALARM, RETRY_ALARM, CLIP_MESSAGE
+  clipEnabled, clipStateOf, CLIP_ALARM, RETRY_ALARM, CLIP_MESSAGE,
+  syncKininari, knSyncRelevant, markKnSyncPending, onKnTabUpdated, KN_SYNC_DELAY_MS, KN_SYNC_KEY, KN_SYNC_ALARM
 } from './kininari.js';
 import {
   syncDrive, connectDrive, disconnectDrive, driveStatus, listBackups, getBackup, driveAlertFor, DRIVE_ALARM
@@ -103,9 +104,11 @@ chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name === DRIVE_ALARM) await syncDriveInBackground();                 // 変更のあと少し待ってから送る
   if (a.name === CLIP_ALARM) await sweepClips();
   if (a.name === RETRY_ALARM) await flushClips({ retry: true });   // 送れなかった分の再送（5分ごと）
+  if (a.name === KN_SYNC_ALARM) await syncKininari({ trigger: 'retry' });   // 開いている気になり帳に、届いていない分類を合わせ直す
 });
 
 chrome.tabs.onUpdated.addListener(onClipTabUpdated);
+chrome.tabs.onUpdated.addListener(onKnTabUpdated);   // 気になり帳を開いたら、届いていない分類の変更を合わせる
 chrome.tabs.onRemoved.addListener(onClipTabRemoved);
 
 /* ---------- 気になり帳へ送る ---------- */
@@ -191,9 +194,25 @@ async function scheduleDriveSync() {
   } catch { /* 30分ごとの確認で送られる */ }
 }
 
+/**
+ * Recall の分類が変わったら、少し待ってから気になり帳と合わせる。
+ * 続けて変えても1回にまとめる。待つのは数秒なので Service Worker は止まらない
+ * （止まっても「未反映」の印が local に残り、次に気になり帳を開いたときに合わせる）。
+ */
+let knSyncTimer = null;
+function scheduleKnSync() {
+  clearTimeout(knSyncTimer);
+  knSyncTimer = setTimeout(() => {
+    knSyncTimer = null;
+    syncKininari({ trigger: 'change' }).catch(() => {});
+  }, KN_SYNC_DELAY_MS);
+}
+
 let refreshTimer = null;
 chrome.storage.onChanged.addListener((changes, areaName) => {
   const keys = Object.keys(changes);
+  // 分類の変更は、画面のどこから変えても（ほかの PC から届いても）ここを通る
+  if (knSyncRelevant(changes, areaName)) { markKnSyncPending().catch(() => {}); scheduleKnSync(); }
   const touched = keys.some(k => k.startsWith(ITEM_PREFIX) || k.startsWith(LOCAL_PREFIX));
   if ((areaName === 'local' && keys.some(k => k.startsWith(LOCAL_PREFIX) || k.startsWith(RICH_PREFIX) || k === LOCAL_TOMBS_KEY))
     || (areaName === 'sync' && (keys.includes(META_KEY) || keys.includes(WIPE_KEY)))) {
@@ -202,7 +221,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   // 設定の変更は「再計算」より先に見る（下の早期 return に隠れないように）
   if (keys.includes(META_KEY)) onClipConfigMaybeChanged();
   // meta だけの変更（設定保存など）では再計算しない → 自分の書き込みで再入しない
-  if (!touched && keys.every(k => k === META_KEY || k === 'lastNotified')) return;
+  if (!touched && keys.every(k => k === META_KEY || k === 'lastNotified' || k === KN_SYNC_KEY)) return;
   if (areaName !== 'sync' && areaName !== 'local') return;
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => refresh(), 400);   // 連続書き込みをまとめる
@@ -367,6 +386,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     resetQueueTries().then(() => flushClips({ force: true, wait: true })).then(sendResponse);
     return true;
   }
+  // 設定の「気になり帳と合わせる」。自動の回と取り合わないよう、ここ（Service Worker）で順番に動かす
+  if (msg && msg.type === 'knSync') { syncKininari({ manual: true, knUrl: msg.knUrl }).then(sendResponse); return true; }
   if (msg && msg.type === 'clipForget') { removeFromQueue(msg.id).then(() => sendResponse({ ok: true })); return true; }
   if (msg && msg.type === 'clipRequeue') {
     // 「元に戻す」で戻した項目を、気になり帳へ送る順番待ちに並べ直す。

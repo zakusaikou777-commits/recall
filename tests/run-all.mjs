@@ -34,10 +34,13 @@ results.push(['ロジック', await run('unit.mjs')]);
 console.log('\n########## 3/3 実ブラウザでの動作テスト ##########');
 if (await hasPlaywright()) {
   results.push(['ブラウザ', await run('e2e.mjs')]);
+  // 気になり帳と合わせる（テスト用のサイトへの権限を付けた拡張機能で、別のブラウザを立てる）
+  results.push(['ブラウザ（気になり帳と合わせる）', await run('e2e-kn-sync.mjs')]);
 } else {
   console.log('playwright が未インストールのため省略します。');
   console.log('実行するには、このフォルダで:  npm install && npm run setup:browser');
   results.push(['ブラウザ', 'skip']);
+  results.push(['ブラウザ（気になり帳と合わせる）', 'skip']);
 }
 
 console.log('\n########## 結果 ##########');
